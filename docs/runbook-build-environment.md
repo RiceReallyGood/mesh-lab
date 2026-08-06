@@ -248,8 +248,13 @@ ulimit -n 65536
     --curses=no --color=no --show_progress_rate_limit=15 \
     --experimental_repository_downloader_retries=2 \
     --http_timeout_scaling=1.0 \
+    --cxxopt=-Wno-nullability-completeness \
     //source/exe:envoy-static
 ```
+
+> **2026-08-06 修正**：这个命令块原先漏了 `--cxxopt=-Wno-nullability-completeness`
+> ——下面 §4.2 的表格里列了它，命令块里却没有。照抄命令块的人会在 cel-cpp 上编译失败，
+> 报 `pointer is missing a nullability type specifier`。已补。
 
 ### 4.2 每个选项的理由
 

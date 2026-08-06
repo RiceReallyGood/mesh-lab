@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -110,9 +111,23 @@ func NewTracer(path, node string) (*Tracer, error) {
 	return t, nil
 }
 
-// Start 在 RPC 开始时被调用。此处不做任何事 —— 采样判定推迟到 Finish，
-// 因为那时才能从 rpcinfo 里读到经 TTHeader 传来的 traceparent。
-func (t *Tracer) Start(ctx context.Context) context.Context { return ctx }
+// Start 在 RPC 开始时被调用。
+//
+// 大部分点位的采样判定推迟到 Finish —— 那时才能从 rpcinfo 里读到经 TTHeader
+// 传来的 traceparent。唯一的例外是 netpoll 读探针：它必须在阻塞读**之前**打开，
+// 事后无法补采，所以只能在这里判一次。
+//
+// 后果是 netpoll 探针只覆盖**客户端**：客户端的 traceparent 是自己在发起前
+// 塞进 ctx 的，此刻可读；服务端的还在对端发来的 TTHeader 里，此刻读不到。
+// 服务端侧的唤醒时刻由 mesh_netpoll_onread 覆盖（那是 Kitex 层事件，
+// 记在 OnRead 入口，不依赖本槽位）。
+func (t *Tracer) Start(ctx context.Context) context.Context {
+	if _, sampled := traceContextFrom(ctx); !sampled {
+		return ctx
+	}
+	ctx, _ = stats.WithNetpollProbe(ctx)
+	return ctx
+}
 
 // Finish 在 RPC 结束时被调用，此时 rpcinfo 里已有完整的事件序列。
 func (t *Tracer) Finish(ctx context.Context) {
@@ -151,6 +166,50 @@ func (t *Tracer) Finish(ctx context.Context) {
 			WallNs: evWall,
 			MonoNs: mono - (wall - evWall),
 			Attrs:  eventAttrs(ev),
+		})
+	}
+
+	t.emitNetpoll(ctx, traceID)
+}
+
+// emitNetpoll 输出 netpoll 内部读路径的各阶段时刻。
+//
+// 这些时刻由 poller goroutine 采集，**不经过 Kitex 的 stats**——
+// stats.Record 记的是调用那一刻的时间，等 RPC goroutine 被调度起来再记，
+// 恰好抹掉我们要测的那段调度延迟。
+//
+// 也正因为不走 stats，它们带着 monotonic 读数，可以直接对 monoBase 求差，
+// 比上面那套「wall 偏移推算」精确 —— 上面的 Kitex 事件只有墙上钟可用。
+func (t *Tracer) emitNetpoll(ctx context.Context, traceID string) {
+	p := stats.NetpollProbeFrom(ctx)
+	if !p.Valid() {
+		return
+	}
+	// Rounds > 1 表示报文被拆成多个 TCP 段，各时刻只描述最后一段。
+	// 原样带出让分析侧决定是否剔除，而不是在这里悄悄丢弃。
+	attrs := map[string]string{"rounds": strconv.FormatInt(p.Rounds, 10)}
+
+	for _, np := range []struct {
+		name string
+		ts   time.Time
+	}{
+		{"mesh_np_epoll_wake", p.EpollWake},
+		{"mesh_np_dispatch", p.Dispatch},
+		{"mesh_np_readv_start", p.ReadvStart},
+		{"mesh_np_readv_done", p.ReadvDone},
+		{"mesh_np_trigger", p.Trigger},
+	} {
+		if np.ts.IsZero() {
+			continue
+		}
+		t.emit(&Event{
+			Host:   t.host,
+			Node:   t.node,
+			Trace:  traceID,
+			Point:  np.name,
+			WallNs: np.ts.UnixNano(),
+			MonoNs: int64(np.ts.Sub(monoBase)),
+			Attrs:  attrs,
 		})
 	}
 }

@@ -63,11 +63,40 @@
 为此给 `RequestOwner` 加了 `downstreamConnectionId()`,**带默认实现返回 0** ——
 `ShadowRouterImpl`(影子流量,不需要打点)因此不受影响。
 
+### ⑤→⑥ 的细分(已实现)
+
+原本 `up_write_done → up_first_byte` 这段「等待上游」把三件事混在一起:真正的等待、
+readv 系统调用、事件循环调度。现已拆开:
+
+| 点位 | 位置 | 含义 |
+|---|---|---|
+| `up_epoll_wake` | `connection_impl.cc` `onFileEvent` 入口(仅读就绪) | **epoll 唤醒后用户态第一个可记录时刻**。⑤→这里才是真正的等待 |
+| `up_readv_start` / `up_readv_done` | `connection_impl.cc` `transport_socket_->doRead()` 前后 | socket 收包。注意 `doRead` 内部是循环,会反复 readv 直到 EAGAIN,所以是「N 次 readv + N 次 append」的总和 |
+
+由此得到:
+
+| 段 | 含义 | 价值 |
+|---|---|---|
+| ⑤ → `up_epoll_wake` | **纯等待**:对端处理 + 网络在途 + 内核协议栈到 epoll 就绪 | 156 µs 的绝大部分 |
+| `up_epoll_wake` → `up_readv_start` | **事件循环内排队** | ★ 低负载≈0,压测下随排队深度增长。**这一刀区分「Envoy 处理慢」与「Envoy 排不过来」** |
+| `up_readv_start` → `up_readv_done` | readv 系统调用 | |
+| `up_readv_done` → ⑥ | buffer 管理 + filter chain 派发 | |
+
+**绑定机制**:给 `Network::Connection` 加了带默认实现的
+`setKitexProbeDownstreamId` / `kitexProbeDownstreamId`,由 `UpstreamRequest::onPoolReady`
+在采样命中时设为下游 conn_id,`releaseConnection` 与 `onResponseComplete` 两条释放路径上都清零。
+
+不用旁路 map 的原因:通用读路径服务全进程所有连接,压测下每个 epoll 事件做一次哈希查找不可接受。
+裸成员让未采样路径退化成一次读加一次分支。
+
+**只挂上游连接**。下游侧做不到——下游的读发生在 `bindTrace` 之前,那时还不知道采样与否。
+
 ### 已知缺口
 
 | 想测但目前测不了 | 为什么还没做 |
 |---|---|
 | **listener accept** | 属于连接级而非请求级;新建连接的成本已体现在 client 侧的 `client_conn_start/finish` 与上游侧的 `up_conn_new` |
+| **下游侧 epoll/readv** | 见上,采样状态在下游读发生时尚不可知 |
 
 ---
 
@@ -97,6 +126,51 @@
 | `mesh_hdr_decode_start/finish` | `ttHeaderCodec.decode` 前后 | TTHeader 解析耗时 |
 | `mesh_hdr_encode_start/finish` | Encode 的 header 段 | TTHeader 编码耗时;mesh 场景的核心成本项 |
 | `mesh_payload_codec_start/finish` | `encodePayload` 前后 | thrift 序列化耗时 |
+
+---
+
+## 二·五、netpoll 内部(5 个点,仅客户端侧)
+
+Kitex 客户端阻塞在 `Peek` 上等响应,这一段占端到端 95% 以上,但它是个黑盒:
+里面混着「对端真没回」「回了但 epoll 没轮到」「读完了但 goroutine 没被调度」三件事,
+优化方向截然相反却无法区分。
+
+时间戳由 **poller goroutine** 采集,经挂在 context 上的槽位带回 RPC goroutine,
+由 Tracer 在 `Finish` 时输出。**不走 `stats.Record`** —— 那记的是调用那一刻的时间,
+等 RPC goroutine 被调度起来再记,恰好抹掉了要测的调度延迟。
+
+| 点位 | netpoll 位置 | 含义 |
+|---|---|---|
+| `mesh_np_epoll_wake` | `poll_default_linux.go` `EpollWait` 返回后 | epoll 唤醒 |
+| `mesh_np_dispatch` | `handler()` 里轮到本连接时 | **同批事件里排在前面的连接占用的时间** |
+| `mesh_np_readv_start` / `_done` | `ioread()` 前后 | readv 系统调用(单次,不像 Envoy 是循环) |
+| `mesh_np_trigger` | `inputAck` 里 `triggerRead` 之前 | 数据已进 LinkBuffer,即将唤醒等待方 |
+
+由此得到的关键量:
+
+| 段 | 含义 |
+|---|---|
+| `mesh_socket_read_start` → `mesh_np_epoll_wake` | **纯等待** |
+| `mesh_np_epoll_wake` → `mesh_np_dispatch` | poller 事件循环内排队 |
+| `mesh_np_readv_start` → `_done` | socket 收包 |
+| **`mesh_np_trigger` → `mesh_first_byte`** | ★ **goroutine 调度延迟**。整套插桩里唯一能量出「数据到了但没被调度起来」的地方 |
+
+### 两个必须知道的限制
+
+**1. 只覆盖客户端。** 探针必须在阻塞读**之前**打开,事后无法补采,所以采样判定只能在
+`Tracer.Start` 做。客户端的 traceparent 是自己塞进 ctx 的,此刻可读;服务端的还在
+对端发来的 TTHeader 里,此刻读不到。服务端侧的唤醒由 `mesh_netpoll_onread` 覆盖。
+
+**2. 快照可能不一致,必须看 `Consistent` 标志。**
+
+初版设计押在「channel 收发构成同步边,普通字段读写即可」上,被 `-race` 直接证伪:
+`waitRead` 在数据已入缓冲区时**直接返回,根本不碰 `c.readTrigger`**,快路径上没有任何同步边。
+
+改成全字段原子访问后无竞争,但原子只保证不撕裂、**不保证同一轮**。
+故由 netpoll 侧校验五个时刻单调不减,不过则置 `Consistent=false`,消费方须**整条丢弃**。
+
+实测良率:请求—响应模式 **100%**;而 writer 全力灌数据的场景只有 2.8%(reader 几乎总走快路径,
+没有唤醒可测)。真实 RPC 属于前者。
 
 ---
 
