@@ -60,6 +60,11 @@ type Tracer struct {
 }
 
 // NewTracer 创建 tracer 并启动落盘 goroutine。
+//
+// host 标识决定 merge 工具是否允许把两个事件的时间戳相减（§8.2），
+// 必须能真正区分机器。不能只靠 os.Hostname()：本实验两台机器的
+// hostname 都是 localhost.localdomain，靠它会把跨机误判成同机。
+// 优先取环境变量 KITEX_PROBE_HOST。
 func NewTracer(path, node string) (*Tracer, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
@@ -68,7 +73,10 @@ func NewTracer(path, node string) (*Tracer, error) {
 	if err != nil {
 		return nil, err
 	}
-	host, _ := os.Hostname()
+	host := os.Getenv("KITEX_PROBE_HOST")
+	if host == "" {
+		host, _ = os.Hostname()
+	}
 
 	t := &Tracer{
 		host: host,

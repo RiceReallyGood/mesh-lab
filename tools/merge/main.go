@@ -202,6 +202,21 @@ func printWaterfall(id string, events []Event, skew map[string]int64) {
 	multiHost := len(hosts) > 1
 	fmt.Printf("║  涉及 %d 个节点，%d 台主机%s\n", len(spans), len(hosts),
 		map[bool]string{true: "（跨机，时长仅在同机内精确）", false: ""}[multiHost])
+
+	// 主动检查 host 标识是否可疑。
+	//
+	// 光靠「正确配置 host」是不够的：本实验两台机器的 hostname 都是
+	// localhost.localdomain，一旦忘记设 KITEX_PROBE_HOST，跨机会被
+	// 静默误判成同机 —— 而跨机相减正是 §8.2 要防的最危险操作。
+	// 与其信任配置，不如让工具自己起疑。
+	for h := range hosts {
+		if h == "localhost" || h == "localhost.localdomain" || h == "unknown" || h == "" {
+			fmt.Printf("║  ⚠ host 标识为 %q，无法区分机器。\n", h)
+			fmt.Printf("║    若本次为跨机部署，请给各节点设置 KITEX_PROBE_HOST，\n")
+			fmt.Printf("║    否则跨机事件会被误判为同机，差值法的前提不再成立。\n")
+			break
+		}
+	}
 	fmt.Println("║")
 
 	for _, s := range spans {
