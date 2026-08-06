@@ -21,7 +21,10 @@ import (
 	"github.com/cloudwego/kitex-benchmark/codec/thrift/kitex_gen/echo"
 	"github.com/cloudwego/kitex-benchmark/codec/thrift/kitex_gen/echo/echoserver"
 	"github.com/cloudwego/kitex/client"
+	"github.com/cloudwego/kitex/pkg/endpoint"
+	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
+	"github.com/cloudwego/kitex/pkg/transmeta"
 	"github.com/cloudwego/kitex/transport"
 
 	"meshlab/demo/probe"
@@ -49,9 +52,27 @@ func main() {
 
 	cli, err := echoserver.NewClient(*service,
 		client.WithHostPorts(*target),
+		// 诊断用：打印实际生效的传输协议。
+		// SetTransportProtocol 内部是 |= 而非赋值（kitex rpcconfig.go:178），
+		// 曾怀疑 TTHeader 被意外 OR 上 Framed，此处用于证实/证伪。
+		client.WithMiddleware(func(next endpoint.Endpoint) endpoint.Endpoint {
+			var once sync.Once
+			return func(ctx context.Context, req, resp interface{}) error {
+				once.Do(func() {
+					if ri := rpcinfo.GetRPCInfo(ctx); ri != nil {
+						log.Printf("[诊断] 实际传输协议 = %s", ri.Config().TransportProtocol())
+					}
+				})
+				return next(ctx, req, resp)
+			}
+		}),
 		// TTHeader 是本方案的前提：Framed 没有 header KV 段，
 		// trace 上下文与路由字段都无处安放。
 		client.WithTransportProtocol(transport.TTHeader),
+		// 默认 MetaHandler 只有 MetainfoClientHandler（kitex internal/client/option.go:234）。
+		// ClientTTHeaderHandler 才是写 FromService/ToService/ToMethod 等 IntKV 的那个，
+		// 不注册的话 TTHeader 里根本没有 IntKV 段，Envoy 的 x-tt-to-service 路由无从匹配。
+		client.WithMetaHandler(transmeta.ClientTTHeaderHandler),
 		client.WithStatsLevel(stats.LevelDetailed),
 		client.WithTracer(tr),
 	)

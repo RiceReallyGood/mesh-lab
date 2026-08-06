@@ -38,24 +38,35 @@ static_resources:
 
                 route_config:
                   name: local_route
+                  # 三条路由构成一组可证伪的 L7 验证：
+                  #   ToService=echo-server  → echo_backend  → 成功
+                  #   ToService=dead-service → dead_backend  → 连接失败（但路由命中）
+                  #   其它                    → 无匹配        → route_missing
+                  #
+                  # 关键是不能有兜底路由。第一版配置里我写了一条
+                  # `match: {method_name: Echo}` 想同时演示按方法名路由，
+                  # 结果它变成了 catch-all —— 任何服务名都能匹配上，
+                  # 于是「改 header 会改变路由」这件事根本无从证伪。
                   routes:
-                    # 路由依据 1：TTHeader IntKV 的 ToService（id=6）。
+                    # 路由依据：TTHeader IntKV 的 ToService（id=6）。
                     # 我们的 transport 把它映射成语义化 header 名 x-tt-to-service，
-                    # 于是 HeaderMatcher 直接可用 —— 这是「真 L7 而非 TCP 透传」
-                    # 最直接的证据：改 header 能改变 cluster 选择。
+                    # HeaderMatcher 直接可用 —— 这是「真 L7 而非 TCP 透传」的硬证据，
+                    # TCP 透传做不到按应用层字段选择后端。
                     - match:
-                        method_name: ""      # 空表示不按方法名过滤
+                        method_name: ""
                         headers:
                           - name: x-tt-to-service
                             string_match: { exact: echo-server }
                       route: { cluster: echo_backend }
 
-                    # 路由依据 2：Thrift 协议层的 method_name。
-                    # 与上一条来源不同（一个来自 transport 的 IntKV，
-                    # 一个来自 protocol 层解出的消息头），两条都验证才能说明
-                    # transport 与 protocol 两层都正确工作。
-                    - match: { method_name: Echo }
-                      route: { cluster: echo_backend }
+                    # 指向一个不存在的后端。命中它说明路由按 header 生效了，
+                    # 失败原因应是连接问题而非 route_missing。
+                    - match:
+                        method_name: ""
+                        headers:
+                          - name: x-tt-to-service
+                            string_match: { exact: dead-service }
+                      route: { cluster: dead_backend }
 
                 access_log:
                   - name: envoy.access_loggers.file
@@ -83,5 +94,24 @@ static_resources:
           # 上游用与下游相同的 transport/protocol。
           # 不显式指定的话 Envoy 会沿用下游的，但写出来更清楚，
           # 也便于后续做「下游 TTHeader、上游 Framed」这类协议转换实验。
+          transport: TTHEADER
+          protocol: BINARY
+
+    # 故意指向不存在的 socket，用于验证「路由命中但后端不可达」
+    # 与「路由未命中」是两种不同的失败 —— 只有能区分这两者，
+    # 才算证明了路由确实按 header 在做选择。
+    - name: dead_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: dead_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe: { path: /tmp/kitex-demo/nonexistent.sock }
+      typed_extension_protocol_options:
+        envoy.filters.network.thrift_proxy:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.thrift_proxy.v3.ThriftProtocolOptions
           transport: TTHEADER
           protocol: BINARY

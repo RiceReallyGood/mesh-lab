@@ -336,6 +336,125 @@ nohup setsid ~/build_envoy.sh >/dev/null 2>&1 </dev/null &
 
 ---
 
+## 4.6 拉起单跳链路
+
+```bash
+mesh-lab/scripts/run-single-hop.sh start    # 起 server + envoy
+mesh-lab/scripts/run-single-hop.sh status
+mesh-lab/scripts/run-single-hop.sh stop
+```
+
+三个**必须**的细节,少一个就跑不起来:
+
+| 细节 | 不做会怎样 |
+|---|---|
+| **`ulimit -n 65536`** | Envoy 启动时报 `Too many open files`,但**只是 warn** —— 进程看似起来了实则不可用 |
+| **`--base-id` 各实例不同** | Envoy 的热重启机制:同 base-id 的新实例启动时会通过共享域套接字**通知旧实例退出**。同机跑多个 Envoy(双跳降级模式)不设就会互相杀死 |
+| **用 tmux 托管,不用 `nohup setsid`** | Envoy 注册了 SIGTERM 处理器,ssh 会话结束时会收到 SIGTERM 优雅退出(日志里是 `caught ENVOY_SIGTERM`)。Go 进程和 xray 在同样条件下能存活,**但 Envoy 不行** |
+
+**验证是否真的在监听**,不能只看 socket 文件存在:
+
+```bash
+ss -xln | grep kitex-demo     # 文件存在 ≠ 有人 listen
+```
+
+我第一版 status 只用 `[ -S "$file" ]` 判断,结果 Envoy 早就死了却报告"已监听"。
+
+## 4.7 Kitex 侧的两个协议陷阱
+
+### 4.7.1 `apache/thrift` 版本必须钉死 v0.13.0
+
+Kitex 的 `bthrift/apache` 兼容层只能配 `v0.13.0`,v0.14+ 给 `TProtocol` 的方法加了 `context` 参数,签名对不上直接编译失败。
+
+`kitex-benchmark` 自己 `go.mod:128` 做了这个 replace,但 **Go 的 replace 指令不会被依赖方继承**,必须在自己的模块里重复声明:
+
+```
+replace github.com/apache/thrift => github.com/apache/thrift v0.13.0
+```
+
+### 4.7.2 `WithTransportProtocol` 是按位或,不是覆盖
+
+```go
+// kitex pkg/rpcinfo/rpcconfig.go:173-181
+func (r *rpcConfig) SetTransportProtocol(tp transport.Protocol) error {
+    if tp == transport.PurePayload {
+        r.transportProtocol = tp
+    } else {
+        r.transportProtocol |= tp      // ← 按位或
+    }
+}
+```
+
+后果:即使显式设 `client.WithTransportProtocol(transport.TTHeader)`,**实际生效的可能是 `TTHeader|Framed`**。
+
+**怎么确认**:别推理,打出来。加个中间件:
+
+```go
+client.WithMiddleware(func(next endpoint.Endpoint) endpoint.Endpoint {
+    return func(ctx context.Context, req, resp interface{}) error {
+        ri := rpcinfo.GetRPCInfo(ctx)
+        log.Printf("实际传输协议 = %s", ri.Config().TransportProtocol())
+        return next(ctx, req, resp)
+    }
+})
+```
+
+实测输出 `TTHeader|Framed` —— 这直接解释了 Envoy 报 `invalid binary protocol version 0x0000`(详见 §5.6)。
+
+### 4.7.3 `ClientTTHeaderHandler` 默认不注册
+
+`internal/client/option.go:234` 里,client 的默认 MetaHandler **只有 `MetainfoClientHandler`**:
+
+```go
+MetaHandlers: []remote.MetaHandler{transmeta.MetainfoClientHandler},
+```
+
+而写 `FromService` / `ToService` / `ToMethod` 这些 **IntKV** 的是 `transmeta.ClientTTHeaderHandler`,**它不在默认列表里**。不显式注册的话,TTHeader 里根本没有 IntKV 段,Envoy 侧基于 `x-tt-to-service` 的路由无从匹配 —— 表现为所有请求 `route_missing`。
+
+```go
+client.WithMetaHandler(transmeta.ClientTTHeaderHandler)   // 必须
+server.WithMetaHandler(transmeta.ServerTTHeaderHandler)   // 对称
+```
+
+### 4.7.4 metainfo 的前缀不要自己加
+
+`metainfo.WithPersistentValue(ctx, key, val)` 在序列化时会自动加 `RPC_PERSIST_` 前缀。若自己在 key 里再加一遍,线上会出现:
+
+```
+RPC_PERSIST_RPC_PERSIST_traceparent
+```
+
+我就是这么写错的,靠抓包才发现。**排查这类问题必须看真实字节**,见 §5.7。
+
+## 5. 排障手册(补)
+
+### 5.7 用 UDS 转储工具看真实字节
+
+Envoy 报"解码失败"时,不要靠推测协议格式 —— 直接看 Kitex 发的字节。
+
+`mesh-lab/tools/udsdump` 是个 UDS 透明转发代理,把双向字节流原样 hexdump:
+
+```bash
+udsdump -listen /tmp/kitex-demo/dump.sock -upstream /tmp/kitex-demo/app.sock
+# 然后让 client 打 dump.sock
+```
+
+本项目靠它一次性发现了三个问题:内层 framed 前缀、metainfo 前缀重复、IntKV 段完全缺失。**任何一个靠读代码都不容易发现。**
+
+解析抓到的帧:
+
+```
+00 00 00 a1   LENGTH = 161
+10 00         MAGIC = 0x1000        ← TTHeader
+00 00         FLAGS
+00 00 00 01   SEQ ID
+00 19         HEADER SIZE = 25 × 4 = 100 字节
+00            PROTOCOL ID = ThriftBinary
+00            NUM TRANSFORMS
+01            INFO ID = 0x01 (StrKV)
+...
+```
+
 ## 5. 排障手册
 
 ### 5.1 定位"卡在哪"的标准序列

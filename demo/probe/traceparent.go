@@ -10,13 +10,20 @@ import (
 	"github.com/bytedance/gopkg/cloud/metainfo"
 )
 
-// TraceparentKey 是 trace 上下文在 TTHeader StrKV 里的键名。
+// TraceparentKey 是 trace 上下文的 metainfo 键名。
 //
-// 用 metainfo 的 persistent 前缀（RPC_PERSIST_）而非普通 key，是为了让它
-// 沿调用链一路透传下去。注意前缀是大写的 —— 过 Envoy 时必须开
-// header_keys_preserve_case，否则会被小写化导致 Kitex 侧静默失配。
-// 这一点由 envoy 单测 TTHeaderMetainfoCaseTest 双向锁定（设计文档 §9.1）。
-const TraceparentKey = metainfo.PrefixPersistent + "traceparent"
+// 注意这里**不能**自己加 RPC_PERSIST_ 前缀 —— metainfo 在序列化到
+// TTHeader StrKV 时会自动加。我最初写成 metainfo.PrefixPersistent+"traceparent"，
+// 结果线上抓到的 key 是 "RPC_PERSIST_RPC_PERSIST_traceparent"，前缀加了两遍。
+//
+// 用 persistent 而非普通 metainfo，是为了让它沿调用链一路透传。
+// 前缀是大写的，过 Envoy 时必须开 header_keys_preserve_case，
+// 否则会被小写化导致 Kitex 侧按大写前缀匹配失败（设计文档 §9.1）。
+const TraceparentKey = "traceparent"
+
+// WireKey 是它在 TTHeader StrKV 里的实际键名，也是 Envoy 侧看到的 header 名
+// （Envoy 会小写化成 rpc_persist_traceparent）。仅用于排查与文档。
+const WireKey = metainfo.PrefixPersistent + TraceparentKey
 
 // W3C traceparent 格式：
 //

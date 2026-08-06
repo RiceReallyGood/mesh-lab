@@ -20,6 +20,7 @@ import (
 	"github.com/cloudwego/kitex-benchmark/codec/thrift/kitex_gen/echo/echoserver"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
+	"github.com/cloudwego/kitex/pkg/transmeta"
 	"github.com/cloudwego/kitex/server"
 
 	"meshlab/demo/probe"
@@ -61,6 +62,8 @@ func main() {
 		// LevelBase 只有 RPCStart/RPCFinish。
 		server.WithStatsLevel(stats.LevelDetailed),
 		server.WithTracer(tr),
+		// 与 client 对称：解析对端发来的 TTHeader IntKV
+		server.WithMetaHandler(transmeta.ServerTTHeaderHandler),
 	)
 
 	go func() {
