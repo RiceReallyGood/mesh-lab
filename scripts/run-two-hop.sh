@@ -32,13 +32,15 @@ start() {
   sleep 2
 
   echo "[2/3] envoy-in (TCP 127.0.0.1:15006, base-id=$BASE_IN)"
+  # 探针输出路径经环境变量传入（不扩展 bootstrap schema，见 probe.cc 注释）。
+  # 不设这两个变量即为「无探针」模式，用于 §8.6 的对照组。
   tmux new-window -t "$SESSION" -n envoy-in \
-    "$ULIMIT_CMD; $ENVOY -c $CONF/two-hop-in.yaml --base-id $BASE_IN --log-level info 2>&1 | tee $RUN/envoy-in.log"
+    "$ULIMIT_CMD; KITEX_PROBE_PATH=$RUN/trace-envoy-in.ndjson KITEX_PROBE_NODE=envoy-in $ENVOY -c $CONF/two-hop-in.yaml --base-id $BASE_IN --log-level info 2>&1 | tee $RUN/envoy-in.log"
   sleep 3
 
   echo "[3/3] envoy-out (UDS $RUN/out.sock, base-id=$BASE_OUT)"
   tmux new-window -t "$SESSION" -n envoy-out \
-    "$ULIMIT_CMD; $ENVOY -c $CONF/two-hop-out.yaml --base-id $BASE_OUT --log-level info 2>&1 | tee $RUN/envoy-out.log"
+    "$ULIMIT_CMD; KITEX_PROBE_PATH=$RUN/trace-envoy-out.ndjson KITEX_PROBE_NODE=envoy-out $ENVOY -c $CONF/two-hop-out.yaml --base-id $BASE_OUT --log-level info 2>&1 | tee $RUN/envoy-out.log"
   sleep 3
 
   status
