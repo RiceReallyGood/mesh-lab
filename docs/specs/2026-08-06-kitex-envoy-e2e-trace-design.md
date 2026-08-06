@@ -107,7 +107,12 @@ Envoy 的 `thrift_proxy` 支持 Apache THeader,但**不支持 Kitex 的 TTHeader
 ### 2.5 由环境推导出的设计约束
 
 1. **aarch64 不是 Envoy 的 CI 一等公民**(上游 CI 覆盖 Ubuntu x86_64/arm64,不覆盖 openEuler)。此风险在 §11 展开。
-2. **不能用 `--config=gcc`** —— 它连带 `--config=libstdc++`,后者要求静态库 `libstdc++.a`(`.bazelrc:165` `BAZEL_LINKLIBS=-l%:libstdc++.a`),而该机**只有动态库 `libstdc++.so.6`,没有 `.a`**。同理 clang 走 libc++ 也不行(**无 libc++**),且本版本已无 `bazel/setup_clang.sh`。**结论:用默认工具链(bazel 自动探测 gcc),不加 `--config`。**
+2. **编译器选择**(此处修正了早期的一个错误判断):
+
+   - **bazel 会自行下载 LLVM 工具链**(`external/llvm_toolchain`)并用它编译,**不依赖系统 gcc/clang**。编译错误信息里出现 `external/llvm_toolchain/bin/cc_wrapper.sh --target=aarch64-unknown-linux-gnu` 即为证据。因此"系统缺 `libstdc++.a` / 缺 libc++"这类担心是不成立的。
+   - **`--config=clang` 是存在的**,定义在 `.bazelrc:124` 的 `common:clang`(前缀是 `common:` 而非 `build:`,故 `grep '^build:clang'` 查不到 —— 早期据此误判为"无 clang config")。它连带 `clang-common` 与 `libc++`。
+   - **`--config=gcc` 确实不可用**:它连带 `--config=libstdc++`,要求静态库 `libstdc++.a`(`.bazelrc:165`),而该机只有 `libstdc++.so.6`。
+   - **当前采用:默认工具链 + 单条警告豁免**(见 §11.5),而非整套 `--config=clang`。理由是后者会改变 `host_platform` 与 `-stdlib`,使已完成的上万个编译动作缓存全部失效。
 3. **bazel output_base 放 `/tmp`**(690 G tmpfs),避免磁盘 IO 成为 384 核的瓶颈。注意 tmpfs 占用的是内存,Envoy opt 构建产物约数十 GB,相对 1379 G 内存安全。
 4. **到 suzhou950 的连接不稳定**(实测多次 `Timeout, server not responding`)。**所有长任务必须 `nohup setsid` 在远端后台运行 + 轮询标记文件**,不可在前台 ssh 里等待;所有传输必须可续传。
 
@@ -1033,7 +1038,49 @@ rewrite objects\.githubusercontent\.com/(.*) gh-proxy.com/https://objects.github
 | 盯单个文件大小 | 该文件下完后转下一个,大小不再变,看起来像卡死 | `du -sm /tmp/eob/external` 看总量 |
 | 盯 `external` 下的**目录数** | 一个 repository rule 可能要下多个文件(如 `rules_buf_toolchains` 下有 buf、protoc-gen-buf-lint、protoc-gen-buf-breaking),期间目录数不变 | 总量 + `lsof` 看当前写入 fd |
 
-### 11.4 已排除的退路:官方构建容器
+### 11.4 已发生:tmpfs 的 inode 耗尽
+
+**症状**:编译阶段大量报 `Could not copy inputs into sandbox: ... (No space left on device)`,**但 `df -h` 显示空间只用了 1%**。
+
+**根因**:
+
+```
+df -h /tmp   →  690G 总量，用了 5.6G，可用 685G      （1%）
+df -i /tmp   →  1,048,576 inode，用了 843,548        （失败时 100%）
+```
+
+tmpfs 挂载参数写死 `nr_inodes=1048576`,**与容量无关**。而 bazel 用 383 路并行,每个 sandbox 都要为 LLVM 头文件创建成千上万个符号链接 —— **inode 消耗与并行度成正比,与数据量无关**。
+
+**处理**:`--output_base` 从 `/tmp` 迁到 `/home`(ext4 on NVMe,2.32 亿 inode,已用 10%)。
+
+**关键**:切换 output_base **不会导致重新下载** —— bazel 的 repository cache(`~/.cache/bazel/.../cache/repos`,按 sha256 索引)独立于 output_base,已有内容会被复用。
+
+**排障要点**:`No space left on device` 未必是空间不足,**必须同时看 `df -h` 与 `df -i`**。
+
+### 11.5 已发生:cel-cpp 触发 `-Wnullability-completeness`
+
+**症状**:
+
+```
+external/cel-cpp/common/internal/reference_count.h:179:36:
+  error: pointer is missing a nullability type specifier
+         [-Werror,-Wnullability-completeness]
+```
+
+**性质:这不是 aarch64 特有问题**,而是 Clang 版本敏感的告警 —— 一旦某翻译单元用到 `_Nonnull`/`_Nullable`,Clang 就要求同文件内所有指针都标注。Envoy 开了 `-Werror`,告警即错误。
+
+**Envoy 上游已知此问题**,在两处做了豁免:
+
+```
+.bazelrc:108   build:macos          --cxxopt=-Wno-nullability-completeness
+.bazelrc:119   common:clang-common  --cxxopt=-Wno-nullability-completeness
+```
+
+我们未启用 `--config=clang`,故未继承该豁免。
+
+**处理**:直接加 `--cxxopt=-Wno-nullability-completeness`,而非切到整套 `--config=clang` —— 后者会改变 `host_platform` 与 `-stdlib=libc++`,使已完成的上万个编译动作缓存失效。
+
+### 11.6 已排除的退路:官方构建容器
 
 曾考虑用 `envoyproxy/envoy-build-ubuntu` 官方构建镜像绕开环境问题,**经查证不可行**:
 

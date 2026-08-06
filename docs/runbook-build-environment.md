@@ -256,11 +256,21 @@ ulimit -n 65536
 | 选项 | 为什么 |
 |---|---|
 | **`--output_base=$HOME/bazel_out`** | **不能用 `/tmp`**,原因见 §4.3。`/home` 是 NVMe 上的 ext4,2.32 亿 inode |
-| **不加 `--config=gcc` / `--config=clang`** | bazel 会自己下载 LLVM 工具链(`llvm_minimal_linux_arm64`)并用 libc++,不依赖系统编译器。加 `--config=gcc` 反而会要求系统的 `libstdc++.a`(该机没有) |
+| **`--cxxopt=-Wno-nullability-completeness`** | 不加会在 `cel-cpp` 上编译失败,原因见 §4.4 |
+| **不加 `--config=gcc`** | 它连带 `--config=libstdc++`,要求系统静态库 `libstdc++.a`(该机只有 `.so`) |
+| **不加 `--config=clang`** | 它存在(见 §4.4),但连带改 `host_platform` 与 `-stdlib=libc++`,会让已完成的上万个编译动作缓存失效 |
 | `--curses=no --color=no` | 否则日志被 `Computing main repo mapping` 反复覆盖,无法判断卡在哪 |
 | `--http_timeout_scaling=1.0` | **低于**默认 6.0。快速失败(原则 ②) |
 | `--experimental_repository_downloader_retries=2` | 应对 `rsproxy.cn` 的冷启动 504 |
 | `ulimit -n 65536` | 默认软限 1024 不够;硬限 524288,无需 sudo |
+
+**关于编译器的一个重要事实**:bazel 会**自行下载 LLVM 工具链**(`external/llvm_toolchain`)并用它编译,**完全不依赖系统的 gcc/clang**。编译错误里出现
+
+```
+external/llvm_toolchain/bin/cc_wrapper.sh --target=aarch64-unknown-linux-gnu
+```
+
+即为证据。所以"系统缺 `libstdc++.a`、缺 libc++"这类担心是不成立的 —— 那只在启用 `--config=gcc` / `--config=libstdc++` 时才成为问题。
 
 ### 4.3 必须把 output_base 放在 /home 而非 /tmp
 
@@ -289,7 +299,31 @@ df -i /tmp   →  1,048,576 inode，用了 843,548     （81%，失败时 100%�
 
 **切换 output_base 不会导致重新下载** —— bazel 的 repository cache(`~/.cache/bazel/_bazel_$USER/cache/repos`,按 sha256 索引)独立于 output_base,已有 1.4 GB 缓存会被复用,只需重新解压。
 
-### 4.4 后台运行与监控
+### 4.4 cel-cpp 的 `-Wnullability-completeness` 编译错误
+
+**症状**:
+
+```
+external/cel-cpp/common/internal/reference_count.h:179:36:
+  error: pointer is missing a nullability type specifier
+         (_Nonnull, _Nullable, or _Null_unspecified)
+         [-Werror,-Wnullability-completeness]
+```
+
+**性质**:**不是 aarch64 特有问题**。这是个 Clang 版本敏感的告警 —— 一旦某翻译单元用到了 `_Nonnull`/`_Nullable`,Clang 就要求同文件内所有指针都标注。Envoy 开了 `-Werror`,告警即错误。
+
+**Envoy 上游已知此问题**,在两处做了豁免:
+
+```
+.bazelrc:108   build:macos          --cxxopt=-Wno-nullability-completeness
+.bazelrc:119   common:clang-common  --cxxopt=-Wno-nullability-completeness
+```
+
+**一个查找上的坑**:`grep '^build:clang' .bazelrc` **查不到 clang config**,因为它的前缀是 `common:` 而非 `build:`(`common:` 对所有 bazel 命令生效,`build:` 只对 build 生效)。我据此一度误判为"Envoy 没有 clang config"。
+
+**处理**:直接加单条 `--cxxopt=-Wno-nullability-completeness`,而不是切到整套 `--config=clang`。后者会改 `host_platform` 和 `-stdlib`,使已完成的编译缓存失效 —— 在一次要跑一万多个 action 的构建里,这个代价很大。
+
+### 4.5 后台运行与监控
 
 ```bash
 nohup setsid ~/build_envoy.sh >/dev/null 2>&1 </dev/null &
