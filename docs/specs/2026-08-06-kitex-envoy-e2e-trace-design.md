@@ -21,10 +21,21 @@
 - 不做 xDS 动态配置(用静态 bootstrap,减少变量)
 - 不做 mTLS(会引入 TLS 握手噪声,干扰时序分析)
 - 不做 iptables 透明拦截(用显式代理;差异写在附录 A)
-- 不做多机部署(时钟问题见 §8.2;差异写在附录 B)
 - 不做 streaming / 多路复用(只做 unary,`transport.TTHeader`)
+- **不支持 KitexProtobuf 载荷**(`ProtocolID=0x04`)—— 显式拒绝而非静默降级,理由见 §3.7
 
-### 1.3 为什么这条路值得走
+### 1.3 部署形态:真实多机
+
+本方案**按多机部署设计并实测**。两台机器:
+
+| 角色 | 机器 | 承载进程 |
+|---|---|---|
+| 主调侧 | suzhou950(`192.168.25.145`) | kitex-client + envoy-out |
+| 被调侧 | suzhou920B(`192.168.25.51`) | envoy-in + kitex-server |
+
+这不是"单机模拟多机",是真的跨主机。由此带来的**时钟问题是本方案最需要严肃对待的部分**,见 §8.2。
+
+### 1.4 为什么这条路值得走
 
 Envoy 的 `thrift_proxy` 支持 Apache THeader,但**不支持 Kitex 的 TTHeader**(§3.1 给出逐字段证明)。这意味着现成的 Envoy 无法在 L7 层理解 Kitex 的默认协议 —— 只能降级到 `Framed`(丢掉全部 header KV),或者退化成 TCP 透传(丢掉全部 L7 能力)。
 
@@ -58,14 +69,47 @@ Envoy 的 `thrift_proxy` 支持 Apache THeader,但**不支持 Kitex 的 TTHeader
 | 观测工具 | strace / ltrace / tcpdump / perf / bpftrace / ss / lsof / nc / jq **全部就位** |
 | 内核旋钮 | `perf_event_paranoid=-1`(perf 非 root 全功能,已实测);`kptr_restrict=0`;eBPF 已由用户开启 |
 | ulimit | nofile 软 1024 / **硬 524288** → 会话内 `ulimit -n 65536`,无需 sudo |
-| 缺失 | **go 未装、bazel 未装** —— 均为用户态解压安装,不需要 sudo |
-| 网络 | GitHub 直连 200 / 0.89s;goproxy.cn 可用;releases.bazel.build 可用 |
+| 已装 | **bazel 8.7.0**(华为云镜像,与 `.bazelversion` 一致,自检通过);**Go 1.26.5 linux-arm64**(aliyun 镜像)。均安装在 `~/`,未使用 sudo |
+| 源码 | `~/envoy_kitex/envoy`(244 M,`--depth 1` clone);`~/envoy_kitex/kitex`(8.7 M) |
+| sudo | **需要密码,不可用** |
 
-### 2.3 由环境推导出的三条设计约束
+### 2.3 被调侧机器(suzhou920B)
 
-1. **aarch64 不是 Envoy 的 CI 一等公民**(上游 CI 覆盖 Ubuntu x86_64/arm64,不覆盖 openEuler)。首要退路是 `--config=gcc`(`.bazelrc:134-149` 备有整组 gcc 兼容开关,说明上游认真支持 gcc)。此风险在 §11 展开。
-2. **bazel output_base 放 `/tmp`**(690 G tmpfs),避免机械盘 IO 成为 384 核的瓶颈。
-3. **跨机开发**:代码在 WSL2 编辑 → rsync 到 suzhou950 构建运行。需要一个稳定的同步脚本(§10.1)。
+| 项 | 值 |
+|---|---|
+| 地址 | `192.168.25.51` —— **与 suzhou950 同网段** |
+| 平台 | openEuler, **aarch64** |
+| CPU / 内存 | 160 核 / 502 GB |
+| /home 可用 | 112 G(已用 85%,需留意) |
+
+**两台同架构(aarch64)是好事** —— 排除了跨架构带来的编译差异与内存序差异,让测出的时序差异只归因于网络与代理本身。
+
+### 2.4 带宽地形(实测,决定了整个工作流)
+
+各链路速度相差**两个数量级**,这直接决定了"什么东西该从哪里下载":
+
+| 链路 | 实测速度 |
+|---|---|
+| suzhou950 → `mirrors.huaweicloud.com` | **11.5 MB/s** |
+| WSL2 → 互联网 | 5.9 MB/s |
+| suzhou950 → `codeload.github.com`(bazel 拉依赖的实际域名) | 1.5 MB/s |
+| **WSL2 → suzhou950** | **~150 KB/s** ← 最慢的一环 |
+| suzhou950 → `releases.bazel.build` | 75 KB/s |
+| suzhou950 → `raw.githubusercontent.com` | 超时不可用 |
+
+**由此确立的工作流原则:大数据绝不经开发机中转。**
+
+- 源码 → 在目标机上直接 `git clone`(244 M 走 codeload,几分钟)
+- 工具二进制 → 优先国内镜像(bazel 走华为云,62.8 MB 仅 5.5 秒)
+- 开发机只传 **KB 级的代码 diff**,慢链路无所谓
+- 机器间传大文件(编译产物)→ 走 950 ↔ 920B 的同网段直连,不经开发机
+
+### 2.5 由环境推导出的设计约束
+
+1. **aarch64 不是 Envoy 的 CI 一等公民**(上游 CI 覆盖 Ubuntu x86_64/arm64,不覆盖 openEuler)。此风险在 §11 展开。
+2. **不能用 `--config=gcc`** —— 它连带 `--config=libstdc++`,后者要求静态库 `libstdc++.a`(`.bazelrc:165` `BAZEL_LINKLIBS=-l%:libstdc++.a`),而该机**只有动态库 `libstdc++.so.6`,没有 `.a`**。同理 clang 走 libc++ 也不行(**无 libc++**),且本版本已无 `bazel/setup_clang.sh`。**结论:用默认工具链(bazel 自动探测 gcc),不加 `--config`。**
+3. **bazel output_base 放 `/tmp`**(690 G tmpfs),避免磁盘 IO 成为 384 核的瓶颈。注意 tmpfs 占用的是内存,Envoy opt 构建产物约数十 GB,相对 1379 G 内存安全。
+4. **到 suzhou950 的连接不稳定**(实测多次 `Timeout, server not responding`)。**所有长任务必须 `nohup setsid` 在远端后台运行 + 轮询标记文件**,不可在前台 ssh 里等待;所有传输必须可续传。
 
 ---
 
@@ -211,7 +255,25 @@ HeaderTransPerfTRecvEnd   = "pre"
 | Kitex server | `remote/trans/netpoll/trans_server.go:69`:`if addr.Network() == "unix"` 有专门分支(会 unlink 残留 sock) | 支持 |
 | Envoy | `api/envoy/config/core/v3/address.proto:23` `message Pipe`;`:197` `Address` oneof | listener 与 cluster endpoint 均支持 |
 
-**采用的切法**(见 §4.1):第 1、3 段 UDS,第 2 段 TCP。理由:第 2 段代表跨主机网络,换 UDS 会丢掉 `ss -ti` 的 RTT/cwnd/重传、`tcpdump` 包级证据,以及 Envoy 的 TCP/TLS 相关 access log formatter(如 commit `24c0256a6f` 新增的 downstream handshake 起止时间点与 RTT)。
+**采用的切法**(见 §4.1):机内两段 UDS,跨机一段 TCP。多机部署下这个切分是天然的 —— UDS 本来就只能在同一台机器上用。
+
+### 3.7 判定七:载荷协议的支持边界
+
+TTHeader 的 `PROTOCOL ID` 字段(偏移 14,uint8)声明了载荷用什么编码。我们的 transport 读它并调 `metadata.setProtocol()`,Envoy 据此挑选对应的 `Protocol` 实现来解载荷。**transport 本身一个载荷字节都不碰,所以分层上是解耦的。**
+
+但端到端能否工作,取决于 Envoy 是否有对应的 `Protocol` 实现。Envoy 只有四个:`binary` / `compact` / `twitter` / `auto`。对照 Kitex 的 ProtocolID:
+
+| Kitex ProtocolID | Envoy 对应 | 本方案处理 |
+|---|---|---|
+| `0x00` ThriftBinary | `ProtocolType::Binary` | ✅ 放行(主路径) |
+| `0x02` ThriftCompact | `ProtocolType::Compact` | ✅ 映射放行(Envoy 有实现;Kitex 自身标注不支持,实际不会出现,但映射保留以求正确) |
+| `0x03` ThriftCompactV2 | 无精确对应 | ❌ 显式拒绝 |
+| `0x04` **KitexProtobuf** | **无** | ❌ **显式拒绝** |
+| `0x10`/`0x11` TTHeader Streaming | 无 | ❌ 显式拒绝(streaming 在 §1.2 已排除) |
+
+**"显式拒绝"是刻意的设计决策,不是偷懒。** 若对 `0x04` 放任不管,Envoy 会拿 thrift binary 的解析器去啃 protobuf 字节流,解出的 method name、字段类型全是垃圾,表现为随机的路由错误或崩溃 —— 排查成本极高。抛一个 `EnvoyException("ttheader: unsupported protocol id 0x04 (KitexProtobuf)")`,一眼就知道发生了什么。
+
+**结论:本方案对载荷协议"在 transport 层无关,在支持列表内有关"。** 说"用户用什么序列化都无所谓"是不准确的;准确表述是"支持 Thrift Binary(及 Compact),其余显式拒绝"。
 
 ---
 
@@ -220,21 +282,35 @@ HeaderTransPerfTRecvEnd   = "pre"
 ### 4.1 拓扑
 
 ```
-┌──────────────┐   UDS    ┌──────────────┐  TCP loopback  ┌──────────────┐   UDS    ┌──────────────┐
-│ kitex-client │ ───────▶ │  envoy-out   │ ─────────────▶ │   envoy-in   │ ───────▶ │ kitex-server │
-│   (进程 A)   │ /run/    │  (进程 B)    │  127.0.0.1:    │  (进程 C)    │ /run/    │  (进程 D)    │
-│              │ out.sock │              │     15006      │              │ app.sock │              │
-└──────────────┘          └──────────────┘                └──────────────┘          └──────────────┘
-     ▲                          ▲                                ▲                        ▲
-  本机 sidecar 通信        ── 模拟跨主机网络 ──              本机 sidecar 通信
-  (绕开 TCP/IP 栈)         (保留 TCP 可观测性)               (绕开 TCP/IP 栈)
+        机器 A: suzhou950 (192.168.25.145)          机器 B: suzhou920B (192.168.25.51)
+   ┌──────────────────────────────────────┐   ┌──────────────────────────────────────┐
+   │                                      │   │                                      │
+   │  ┌────────────┐  UDS  ┌───────────┐  │   │  ┌───────────┐  UDS  ┌────────────┐  │
+   │  │kitex-client│──────▶│ envoy-out │──┼───┼─▶│ envoy-in  │──────▶│kitex-server│  │
+   │  │  (进程 A)  │ out.  │  (进程 B) │  │   │  │ (进程 C)  │ app.  │  (进程 D)  │  │
+   │  └────────────┘ sock  └───────────┘  │   │  └───────────┘ sock  └────────────┘  │
+   │                                      │   │       ▲                              │
+   └──────────────────────────────────────┘   └───────┼──────────────────────────────┘
+                    │                                 │
+                    └────── 真实跨主机 TCP ───────────┘
+                            :15006  同网段
 ```
 
 **全程 TTHeader + Thrift Binary,不降级。**
 
-三段地址全部做成配置项,可一键切回全 TCP —— 这本身构成一组 A/B 实验(同机 UDS vs loopback TCP 的开销差),是报告的一个数据点。
+**这个切分在多机下是天然的**:UDS 本来就只能同机使用,所以"机内走 UDS、跨机走 TCP"不是人为设计,而是部署形态自己决定的。好处正如 §3.6 所说 —— 协议栈开销只出现在真正的网络段上,与 sidecar 自身处理开销天然分离。
 
-**两个 Envoy 是独立进程,不是一个进程开两个 listener。** 原因:只有独立进程才能把每一跳的连接池、worker 线程、内存占用单独量出来;合并进程会让双跳开销无法拆分。
+**机内那两段仍做成可切 TCP 的配置项** —— 切回 loopback TCP 就得到一组 A/B(同机 UDS vs loopback TCP 的开销差),是报告的一个数据点。
+
+**两个 Envoy 天然是独立进程**(本来就在不同机器上),每一跳的连接池、worker 线程、内存占用都能单独量。
+
+### 4.1.1 单机降级模式(调试用)
+
+多机链路出问题时不好定位,因此保留一个**四进程全在 suzhou950** 的降级模式,中间段走 `127.0.0.1:15006`。用途仅限于:
+- 排查"是代码问题还是网络问题"
+- 阶段 2/3 的功能性验证(见 §10.2)
+
+**性能数据一律以多机模式为准**,单机模式的数字不进报告结论。
 
 ### 4.2 路由设计(L7 证据)
 
@@ -517,14 +593,19 @@ demo/
 
 ### 交叉验证手段
 
-打点数据不能自证正确,用外部工具交叉校验(suzhou950 上全部可用):
+打点数据不能自证正确,用外部工具交叉校验(两台机上工具均已就位):
 
-| 校验对象 | 工具 | 校验什么 |
-|---|---|---|
-| `WriteFinish` → `dn_first_byte` | `strace -T -e trace=write,sendto,epoll_wait` | 打点间隔是否与 syscall 耗时吻合 |
-| `NetpollOnReadEnter` 的准确性 | `bpftrace` uprobe + `tracepoint:syscalls:sys_exit_epoll_wait` | Go 侧唤醒时刻 vs 内核 epoll 返回时刻 |
-| 第 2 段(TCP)传输延迟 | `tcpdump -i lo --time-stamp-precision=nano` | 包级时序 vs 打点时序 |
-| Envoy 内部 CPU 分布 | `perf record -g`(非 root 可用) | 热点是否落在预期函数 |
+| 校验对象 | 工具 | 校验什么 | 跨机可用? |
+|---|---|---|---|
+| `WriteFinish` → `dn_first_byte`(机内 UDS 段) | `strace -T -e trace=write,sendto,epoll_wait` | 打点间隔是否与 syscall 耗时吻合 | 同机,✅ |
+| `NetpollOnReadEnter` 的准确性 | `bpftrace` uprobe + `tracepoint:syscalls:sys_exit_epoll_wait` | Go 侧唤醒时刻 vs 内核 epoll 返回时刻 | 同机,✅ |
+| 跨机 TCP 段 | **两端同时** `tcpdump -i <NIC> --time-stamp-precision=nano` | 包级时序;**注意两端抓包时间戳同样受 16.34 s 偏斜影响**,只能各自与本机打点比对 | ⚠️ 见下 |
+| Envoy 内部 CPU 分布 | `perf record -g`(`perf_event_paranoid=-1`,非 root 可用) | 热点是否落在预期函数 | 同机,✅ |
+| 跨机往返总时长 | §8.2.3 差值法 | 与 `ping` 的 RTT(实测 0.057 ms)量级是否自洽 | ✅ |
+
+**跨机 tcpdump 的正确用法**:两端抓到的包时间戳分属两台机器的时钟,**不可直接相减**(同 §8.2)。正确做法是各端把"本机 tcpdump 时间戳"与"本机打点时间戳"比对,验证**本机内**的打点准确性;跨机的部分仍由差值法给出。
+
+**基线参考**:两机 `ping` 实测 RTT `min/avg/max/mdev = 0.047/0.057/0.081/0.013 ms`,0% 丢包。差值法算出的跨机往返应当 ≥ 这个量级;若小于它,说明分析有误。这是一条廉价但有效的自洽性检查。
 
 ---
 
@@ -535,26 +616,125 @@ demo/
 四进程写同一种 NDJSON,一行一点:
 
 ```json
-{"ts":1754438400123456789,"trace":"4bf92f3577b34da6a3ce929d0e0e4736","span":"00f067aa0ba902b7","node":"envoy-out","point":"pool_ready","attrs":{"new_conn":true,"cluster":"echo-in"}}
+{"host":"suzhou950","node":"envoy-out","trace":"4bf92f3577b34da6a3ce929d0e0e4736",
+ "span":"00f067aa0ba902b7","parent":"0000000000000001","point":"pool_ready",
+ "wall_ns":1754438400123456789,"mono_ns":98234512345,
+ "attrs":{"new_conn":true,"cluster":"echo-in"}}
 ```
 
-- `ts`:**纳秒 epoch**
-- `node` ∈ `{kitex-client, envoy-out, envoy-in, kitex-server}`
-- `trace`:W3C trace-id(32 hex)
+字段语义(**`wall_ns` 与 `mono_ns` 的分工是本设计的关键**):
 
-### 8.2 时钟(最容易出错的地方)
+| 字段 | 含义 | 允许怎么用 |
+|---|---|---|
+| `host` | 物理机标识 | 判断两个点是否同机 —— **决定能否直接相减** |
+| `node` | 逻辑角色 ∈ `{kitex-client, envoy-out, envoy-in, kitex-server}` | 泳道归属 |
+| `trace` / `span` / `parent` | W3C trace-id(32 hex)+ span 树 | 因果结构 |
+| `wall_ns` | 该机 `CLOCK_REALTIME` 纳秒 | **仅粗排序与人眼可读;跨 host 严禁相减** |
+| `mono_ns` | 该机 `CLOCK_MONOTONIC` 纳秒 | **同 host 内精确相减;跨 host 严禁相减** |
 
-四进程在**同一台机器**,因此:
+merge 工具必须**强制检查 `host` 字段**:任何跨 host 的时间戳相减都应当在工具层面被拒绝,而不是靠人自觉。这是把 §8.2 的纪律固化进代码。
 
-**必须用 `CLOCK_REALTIME`** —— Go 的 `time.Now()`、Envoy 的 `TimeSource::systemTime()`。vDSO 读取,同一硬件时钟源,**跨进程可直接比较,无需任何对齐**。
+### 8.2 时钟 —— 多机部署下最容易出错的地方
 
-**绝不能用 `CLOCK_MONOTONIC` 做跨进程比较** —— 它的零点是每进程、每次启动各不相同的,跨进程相减毫无意义。按直觉选 monotonic 是此类工作最常见的错误。
+这是整个方案技术上最需要小心的部分。**跨机器的绝对时间戳不可直接相减。**
 
-**两种时钟各司其职**:
-- 跨进程时序 → `CLOCK_REALTIME`
-- 单点内部时长(如"编码耗时") → `CLOCK_MONOTONIC`,避免 NTP 阶跃污染
+#### 8.2.0 实测:本环境两台机的时钟差 16.34 秒
 
-**多机场景下本方案失效** —— 详见附录 B。
+不是假设,是量出来的。用夹逼法(`t1 = 本机时间;tb = 远端时间;t2 = 本机时间`,取 `tb − (t1+t2)/2`)测 5 次:
+
+| 次数 | 920B 相对 950 的偏移 | 测量不确定度 |
+|---|---|---|
+| 1 | **−16331 ms** | ±57 ms |
+| 2 | −16340 ms | ±48 ms |
+| 3 | −16345 ms | ±44 ms |
+| 4 | −16339 ms | ±49 ms |
+| 5 | −16341 ms | ±47 ms |
+
+五次结果离散度仅 14 ms,远小于单次测量不确定度 —— **这是一个稳定的 16.34 秒固定偏移,不是抖动**。
+
+成因已查明:
+
+| | suzhou950 | suzhou920B |
+|---|---|---|
+| `timedatectl NTPSynchronized` | **no** | yes |
+| chrony 状态 | 无 | 偏离 NTP 200 µs |
+
+**这个数字的意义:**
+
+1. 若按单机思路把两台机的绝对时间戳排在同一条轴上,**每条 trace 都会显示 server 在 client 发出请求的 16 秒之前返回了响应** —— 结果是纯粹的垃圾。
+2. 但 16 秒这么离谱**反而是幸运的**,因为一眼能看出错。**真正致命的是几毫秒级的偏斜** —— 那会产出"看起来完全合理、但每个数都是错的"结论,而被测量的段延迟本身就是微秒级。
+3. §8.2.3 的差值法对任意大小的偏移完全免疫,因为它只在同一台机器内部做减法。
+
+**运维建议(不影响分析正确性,但影响可视化)**:建议在 suzhou950 上启用 NTP(需 root)。16 秒偏移会让合并后的 waterfall 在**视觉上**呈现"响应早于请求"的错乱 —— 导出的时长数字仍然正确,但图没法看。毫秒级同步即可,见 §8.2.6。
+
+#### 8.2.1 问题的量级
+
+要测的段延迟是**微秒级**,而:
+
+| 同步手段 | 典型精度 | 够用吗 |
+|---|---|---|
+| 无同步 | 秒~分钟级漂移 | ❌ |
+| NTP / chrony(公网) | **毫秒级** | ❌ 比被测量大 3 个数量级 |
+| NTP(局域网、低抖动) | 亚毫秒~百微秒 | ❌ 仍与被测量同量级 |
+| PTP(IEEE 1588,需硬件时间戳网卡+交换机支持) | 微秒~亚微秒 | ✅ 但需专门硬件 |
+
+**结论:不能把"两台机器的时钟对齐到足够精度"当作方案的前提。** 必须设计成对偏斜免疫。
+
+#### 8.2.2 采用的模型:span 树 + 本地时长
+
+抛弃"把所有时间戳排在一条全局绝对时间轴上"的做法,改用 **OpenTelemetry / Zipkin 的 span 模型**:
+
+每个 span 记录三样东西:
+- **本地 start**:该机 `CLOCK_REALTIME`,**只用于粗排序和人眼可读**,不参与精确计算
+- **duration**:该机 `CLOCK_MONOTONIC` 测量,**精确,不受 NTP 阶跃影响**
+- **parent 链接**:构成因果树
+
+分布式 tracing 系统之所以都是这个模型,原因正是时钟偏斜。我们不是在发明轮子,是在避免重造一个已知会塌的轮子。
+
+#### 8.2.3 跨机延迟怎么算:差值法,偏斜自动抵消
+
+核心技巧 —— **网络时间由两个"各自在本机测量的时长"相减得到**:
+
+```
+网络往返时间 = client 侧观测的 RPC 总时长 − server 侧观测的处理时长
+             └─ 机器 A 的单调钟测 ─┘      └─ 机器 B 的单调钟测 ─┘
+```
+
+两项各自在本机测量,**相减时两台机器的时钟偏斜完全抵消**,不需要任何同步。同理可逐层剥出每一跳的开销:
+
+```
+envoy-out 转发开销 = (client 观测总时长) − (envoy-out 观测的 upstream 往返时长) − (client 本地编解码)
+跨机网络往返     = (envoy-out 观测的 upstream 往返) − (envoy-in 观测的总处理时长)
+envoy-in 转发开销 = (envoy-in 观测总时长) − (server 观测的处理时长)
+```
+
+#### 8.2.4 必须承认的根本限制
+
+**差值法只能得到往返总和,无法拆成"去程"和"回程"。**
+
+要拆,数学上必须有同步时钟 —— 这是信息论层面的限制,不是本方案的缺陷。**所有分布式 tracing 系统都受此约束**,Jaeger/Zipkin 的 UI 里那些看起来分得清去回程的图,要么依赖了时钟同步(并因此不准),要么其实也只是在画往返。
+
+报告中凡是涉及跨机的数字,一律标注为"往返",不伪造单向数字。若确实需要单向拆分,唯一正解是 PTP + 硬件时间戳网卡,列为后续工作。
+
+#### 8.2.5 `pcs/pce/pss/prs/pre` 的正确用法
+
+§3.5 提到 Kitex 预留了这套 perf key。**多机下它们的正确语义是"每跳自报本跳内部区间",而不是"各跳往同一条时间轴上盖戳"。**
+
+消费方只把它们当**区间**用(区间的两端都在同一台机器上测,所以有效),**绝不跨机相减**。这个区别很容易搞错,是本方案里最需要 code review 盯住的一点。
+
+#### 8.2.6 仍然要跑 NTP —— 但目的不同
+
+两台机仍需 chrony/NTP 保持毫秒级同步。**目的不是精度,而是让因果序在可视化时不出现"响应早于请求"这种视觉错乱。** 毫秒级足够。
+
+#### 8.2.7 偏斜鲁棒性必须被验证,不能只是声明
+
+本环境恰好有 **16.34 秒**的天然偏斜(§8.2.0),这是难得的测试素材 —— 一旦启用 NTP 就消失了。因此**刻意保持 950 不同步,直到三重验证的前两步完成**。
+
+三重验证的完整定义见 §10.2 第 5 级。核心一条:
+
+> **在 merge 工具中注入人工偏移**:给某一节点的全部时间戳统一加 ±50 ms,断言导出的**每一跳时长一个数都不变**。
+
+不做这一步,"支持多机"就只是一句声明。
 
 ### 8.3 trace_id 的"先占位后回填"
 
@@ -570,11 +750,33 @@ demo/
 
 ### 8.4 汇聚与呈现
 
-离线 Go 工具 `cmd/merge`:读四份 NDJSON → 按 trace 分组 → 按 ts 排序 → 输出三种形态:
+**数据收集**:两台机各写各的 NDJSON。收集走 950 ↔ 920B 直连(同网段,实测 200 MB 传输正常),**不经开发机**。
 
-1. **终端 waterfall**(ASCII,每段标注 Δµs)
-2. **Chrome Trace Event JSON** —— 可直接拖入 `chrome://tracing` 或 Perfetto,四进程显示为四条泳道
+离线 Go 工具 `cmd/merge` 的处理流程:
+
+```
+读多机 NDJSON
+  → 按 trace 分组
+  → 按 host 分区                      ← 关键：同 host 才允许时间戳运算
+  → 各 host 内用 mono_ns 算 span duration
+  → 按 parent 链接拼 span 树
+  → 跨 host 段用差值法导出（§8.2.3）
+  → 输出
+```
+
+**工具层必须强制的三条纪律**(把 §8.2 的规则固化进代码,而非靠人自觉):
+
+1. **跨 host 的时间戳相减 → 直接报错**,不允许静默出数
+2. **跨 host 的段一律标注"往返"**,不输出单向数字(§8.2.4)
+3. **提供 `--inject-skew <node>=<±ms>` 开关** —— 用于 §10.2 第 5 级的鲁棒性验证;正是因为这个开关的存在,"偏斜无关"才是可证伪的
+
+**三种输出形态**:
+
+1. **终端 waterfall**(ASCII,每段标注 Δµs;跨 host 段标注 `[往返]`)
+2. **Chrome Trace Event JSON** —— 可直接拖入 `chrome://tracing` 或 Perfetto,四进程显示为四条泳道,**按 host 分组**
 3. **汇总统计** —— 各段 p50/p99,回答"双跳 sidecar 的开销分布"
+
+> **可视化的诚实性**:Perfetto 需要一条统一时间轴,而跨机时间戳不可比。做法是**以 client 的 `RPCStart` 为原点做逻辑对齐**,并在图上显式标注"跨机段为往返估计,非绝对时刻"。绝不把偏斜过的绝对时间戳直接画上去 —— 那会画出"响应早于请求"的图。
 
 ---
 
@@ -627,31 +829,67 @@ Kitex server 端有 unlink 处理(`trans_server.go:69` 分支),Envoy 侧需确�
 
 本方案体量较大(新 Envoy transport + 探针库 + Kitex 改动 + demo + 汇聚工具)。按下表切成 6 个阶段,**每个阶段都有独立的完成判据**,避免长时间处于"写了很多但什么都没验证"的状态。
 
-| 阶段 | 内容 | 完成判据 | 对应验证级 |
-|---|---|---|---|
-| **0** | 装 bazelisk + Go;**验证 Envoy 在 openEuler aarch64 上编得过** | `envoy-static` 产出且 `--version` 正常 | — |
-| **1** | TTHeader transport(§5.1 + §5.2) | round-trip 单测全绿 | 第 1 级 |
-| **2** | 静态 bootstrap + 单跳打通 | echo 通 | 第 2 级 |
-| **3** | 路由配置(IntKV header + method_name) | 改 header 能改变 cluster 选择;metainfo 往返完整 | 第 3 级 |
-| **4** | 探针库(§5.3)+ Kitex 打点(§6)+ 双跳 | 42 个点齐全,能 merge 出单请求 waterfall | 第 4 级 |
-| **5** | merge 工具 + A/B 实验(UDS vs TCP、打点开销) | 交付物 §10.3 齐备 | — |
+| 阶段 | 内容 | 完成判据 | 对应验证级 | 状态 |
+|---|---|---|---|---|
+| **0a** | 工具链就位:bazel 8.7.0 + Go + 两仓源码 | `bazel --version` 正常 | — | **✅ 已完成** |
+| **0b** | **验证 Envoy 在 openEuler aarch64 上编得过** | `envoy-static` 产出且 `--version` 正常 | — | **🔄 进行中,尚未进入编译阶段** |
+| **1** | TTHeader transport(§5.1 + §5.2) | round-trip 单测全绿 | 第 1 级 | 待开始 |
+| **2** | 静态 bootstrap + 单跳打通(单机降级模式) | echo 通 | 第 2 级 | 待开始 |
+| **3** | 路由配置(IntKV header + method_name) | 改 header 能改变 cluster 选择;metainfo 往返完整 | 第 3 级 | 待开始 |
+| **4** | 探针库(§5.3)+ Kitex 打点(§6)+ 双跳(单机) | 42 个点齐全,能 merge 出单请求 waterfall | 第 4 级 | 待开始 |
+| **5** | 真实跨机部署 + merge 工具 + 时钟鲁棒性验证 | §10.3 交付物齐备 | 第 5 级 | 待开始 |
 
-**阶段 0 必须最先做且不可跳过** —— 它验证的是 §11 中唯一可能推翻整体方案的风险。若阶段 0 失败,后续所有 C++ 工作都无处落地,应立即转入退路(§11 第一行)。
+**阶段 0b 必须最先做且不可跳过** —— 它验证的是 §11 中唯一可能推翻整体方案的风险。若失败,后续所有 C++ 工作都无处落地,应立即转入退路(§11 第一行)。
+
+> **诚实声明**:至本文修订时,阶段 0b **尚未完成**。构建两次卡在依赖拉取阶段(§11.1),**一行 Envoy 代码都还没有真正编译过**,因此 "aarch64 能编过" 既未被证实也未被证伪。本报告的所有 C++ 设计以此风险未消除为前提。
 
 ### 10.1 构建路径(全部在 suzhou950,无需 sudo)
 
-| 步骤 | 要点 | 预估 |
+**已完成的步骤(实测数据)**:
+
+| 步骤 | 实际做法 | 实测耗时 |
 |---|---|---|
-| 装 bazelisk | 解压到 `~/bin`;自动拉取 `.bazelversion` 指定的 **bazel 8.7.0**(aarch64) | 分钟级 |
-| 装 Go | linux-arm64 tarball → `~/sdk/go`;`GOPROXY=https://goproxy.cn` | 分钟级 |
-| 拉源码 | 从 GitHub 直连 clone 最新 envoy / kitex | 分钟级 |
-| 编 Envoy | `bazel build --config=clang --output_base=/tmp/eob //source/exe:envoy-static` | **首次 30–60 min**,增量分钟级 |
-| 编 demo | `go build`,arm64 原生 | 秒级 |
-| 同步 | WSL2 编辑 → `rsync` 到 suzhou950 | 秒级 |
+| 装 bazel | **不用 bazelisk**(其 GitHub release 从该机下不动)。直接从**华为云镜像**取 8.7.0 二进制 → `~/bin/bazel` | **5.5 s @ 11.5 MB/s** |
+| 装 Go | `mirrors.aliyun.com` 的 go1.26.5 linux-arm64 → `~/sdk/go` | 秒级 |
+| 拉源码 | **在 suzhou950 上直接 `git clone --depth 1`**,不从开发机传 | envoy 244 M,分钟级 |
+
+**关键经验**:开发机 → suzhou950 只有 ~150 KB/s(§2.4),因此
+
+> **凡是大文件,一律在目标机上直接从国内镜像/codeload 获取,绝不经开发机中转。**
+
+同一个 bazel 二进制:开发机下载 10.6 s,但传到 suzhou950 需 ~7 min;而 suzhou950 直接从华为云取只要 5.5 s。**差 76 倍。**
+
+**构建命令**:
+
+```bash
+ulimit -n 65536
+~/bin/bazel --output_base=/tmp/eob build -c opt \
+    --curses=no --color=no \
+    --experimental_repository_downloader_retries=10 \
+    --http_timeout_scaling=2.0 \
+    //source/exe:envoy-static
+```
+
+要点说明:
+
+| 选项 | 为什么 |
+|---|---|
+| **不加 `--config=gcc` / `--config=clang`** | 前者要 `libstdc++.a`(该机没有),后者要 libc++(也没有)且本版本已无 `setup_clang.sh`。用默认自动探测工具链 |
+| `--output_base=/tmp/eob` | `/tmp` 是 690 G tmpfs,避免磁盘 IO 拖累 384 核 |
+| `--curses=no --color=no` | 否则日志被 `Computing main repo mapping` 反复覆盖,无法判断卡在哪个依赖 |
+| `--http_timeout_scaling=2.0` | **低于**默认 6.0。面对间歇性故障要快速失败,不能拉长等待(§11.1) |
+| 外层 10 次重试循环 | 仅在识别为网络错误时重试;编译错误立即停止 |
+| `ulimit -n 65536` | 默认 1024 不够;硬限 524288,无需 sudo |
+
+**远程执行纪律**(因连接不稳,§2.5 第 4 条):
+
+- 长任务一律 `nohup setsid <script> </dev/null &` + 轮询标记文件,**绝不在前台 ssh 里等待**
+- 不使用 ssh ControlMaster 复用 —— 连接僵死后 socket 残留会让后续所有复用它的 ssh 挂起
+- 重启构建前先确认无残留 bazel 客户端/服务端进程占锁(`Another command is running` 即为此症状)
 
 ### 10.2 验证阶梯
 
-四级,每级可独立证伪,避免"全连上了但不知道哪坏了":
+五级,每级可独立证伪,避免"全连上了但不知道哪坏了":
 
 **第 1 级 · 协议正确性(不需要跑 Envoy)**
 
@@ -669,29 +907,69 @@ C++ 单测:用 Kitex 真实产生的 TTHeader 字节流(从 demo 抓取并固化
 
 这是"真 L7 而非 TCP 透传"的硬证据 —— TCP 透传做不到这件事。
 
-**第 4 级 · 双跳全链路打点**
+**第 4 级 · 双跳全链路打点(单机降级模式)**
 
-四进程齐发,merge 出 waterfall;用 §7 的交叉验证手段校验关键 Δ。
+四进程全在 suzhou950,merge 出 waterfall;用 §7 的交叉验证手段校验关键 Δ。
+
+此级用单机模式,目的是**在引入跨机变量之前**先确认打点逻辑本身正确。
+
+**第 5 级 · 真实多机 + 时钟鲁棒性**
+
+这一级才是本方案的真正验收,三条断言缺一不可:
+
+| # | 断言 | 怎么验 |
+|---|---|---|
+| 5a | 跨机链路端到端打通,42 个点齐全 | 950 跑 client+envoy-out,920B 跑 envoy-in+server |
+| 5b | **merge 工具拒绝任何跨 host 的时间戳相减** | 构造一条跨 host 直减的调用,断言工具报错而非静默出数 |
+| 5c | **偏斜鲁棒性** | 见下 |
+
+**5c 的具体做法** —— 三重验证,层层加码:
+
+1. **真实偏斜**:本环境两机天然有 **16.34 秒**偏移(§8.2.0 实测)。直接跑,断言导出的每跳时长合理(而非出现负数或 16 秒量级的荒谬值)。
+2. **人工注入**:在 merge 工具中给某一节点全部时间戳统一加 ±50 ms,断言导出的**每一跳时长逐位不变**。
+3. **消除偏斜后复测**:待 950 启用 NTP、两机偏差降到毫秒级后重跑,断言导出时长与步骤 1 的结果**在测量误差内一致**。
+
+第 3 步是最有说服力的一条:**同一套分析,在 16 秒偏斜和毫秒偏斜两种条件下给出相同答案**,才算真正证明了偏斜无关性。只做第 2 步(纯人工注入)有可能因为注入方式与真实偏斜的作用路径不同而漏掉问题。
 
 ### 10.3 交付物
 
 1. 本设计报告
-2. 可复现的构建 / 运行脚本
-3. 一次真实请求的 waterfall(终端 + Perfetto 两种形态)
+2. 可复现的构建 / 运行脚本(含两机分发)
+3. 一次真实跨机请求的 waterfall(终端 + Perfetto 两种形态)
 4. UDS vs loopback TCP 的 A/B 数据
 5. 打点开销自身的量化(`--define kitex_probe=disabled` 对照组)
+6. **时钟鲁棒性验证报告**(§10.2 第 5 级三重验证的结果)
 
 ---
 
 ## 11. 风险与退路
 
-| 风险 | 概率 | 影响 | 退路 |
+| 风险 | 概率 | 影响 | 状态 / 退路 |
 |---|---|---|---|
-| **openEuler aarch64 编不过 Envoy** | 中 | 高(阻塞全部) | ① `--config=gcc`(`.bazelrc:134-149` 备有整组兼容开关);② 用官方 Envoy 构建容器(docker 权限用户已开通);③ 最坏情况用预编译 envoy 二进制验证 §10.2 第 2–3 级,只有插桩部分受阻 |
-| bazel 拉依赖慢/失败 | 中 | 中 | GitHub 直连实测 0.89s;失败时用 `--distdir` 预下载(依赖清单在 `bazel/repository_locations.bzl`) |
+| **openEuler aarch64 编不过 Envoy** | 中 | 高(阻塞全部) | **仍未验证** —— 至本文修订时构建尚未进入编译阶段(卡在依赖拉取),**不能声称此风险已消除**。退路:① 用官方 Envoy 构建容器(docker 权限已开通);② 最坏情况用预编译 envoy 二进制验证 §10.2 第 2–3 级,仅插桩部分受阻。**注意 `--config=gcc` 不可用**(见 §2.5 第 2 条) |
+| **bazel 依赖拉取失败** | **高(已发生)** | 中 | 已实际发生两次。见 §11.1 |
 | TTHeader 解析边界情况遗漏 | 中 | 中 | 第 1 级单测用真实字节流 fixture,不用手工构造 |
 | 打点本身扰动时序 | 低 | 中 | thread_local 无锁 + 批量 flush;并用编译期开关做对照实验量化 |
 | metainfo 大小写问题漏配 | 中 | **高(静默)** | 第 3 级验证中显式断言 metainfo 往返完整 |
+| **跨机时钟偏斜导致结论错误** | **高(环境实测 16.34 s)** | **高(静默)** | §8.2 全套设计针对此;§10.2 第 5 级三重验证把关 |
+| 920B 磁盘紧张 | 中 | 低 | /home 已用 85%,仅余 112 G。920B 只放二进制与 trace 数据,不放构建产物 |
+
+### 11.1 已发生的风险:bazel 依赖拉取
+
+**现象**:两次构建均卡在依赖拉取阶段,一次报 `Connect timed out`(googleapis),一次在 `build_bazel_rules_apple` 之后静默停滞 7 分钟且无任何网络连接。
+
+**根因分析**:
+
+1. suzhou950 到 GitHub 的连接是**间歇性抽风**,不是持续不可达。同一 URL 前后两次实测差异极大:`github.com` 时而 0.89 s / 200,时而 20 s 超时;`raw.githubusercontent.com` 时而超时,时而 0.61 s / 200。该机**无全局 IPv6**,全部走 IPv4。
+2. **第二次卡死是配置失误自招的**:为"应对不稳网络"把 `--http_timeout_scaling` 设成 `10.0`,结果 bazel 陷进超长超时等待,**外层重试机制根本没机会触发**。
+
+**教训(已固化进构建脚本)**:
+
+> 面对**间歇性**故障,正确策略是**快速失败 + 多次重试**,而不是延长单次等待。拉长超时只会把"快速失败后重试即可成功"变成"长时间挂死"。
+
+**当前配置**:`--http_timeout_scaling=2.0`(低于 `.bazelrc:52` 默认的 6.0)+ `--experimental_repository_downloader_retries=10` + 外层 10 次重试循环,且**仅在识别为网络错误时才重试**(编译错误立即停止,避免浪费)。
+
+**仍未用上的退路**:`--distdir` 预下载(依赖清单在 `bazel/repository_locations.bzl`)。因开发机到 suzhou950 仅 ~150 KB/s,传输 GB 级 distdir 不现实,故此退路实际不可行;真正的退路是官方构建容器。
 
 **关于第一条**:这是唯一可能推翻整体方案的风险,因此在实施第一步就验证,不拖到后期。
 
@@ -707,15 +985,22 @@ C++ 单测:用 Kitex 真实产生的 TTHeader 字节流(从 demo 抓取并固化
 
 **对本方案的全部打点结论无影响** —— 进入 sidecar 之后的路径完全一致。透明拦截额外引入的是 netfilter 的 conntrack 开销与一次 `getsockopt(SO_ORIGINAL_DST)`,可作为后续扩展实验。
 
-## 附录 B:多机部署时的时钟问题
+## 附录 B:若要拆分单向延迟,需要什么
 
-§8.2 的方案依赖"四进程同机、共享硬件时钟"。一旦拆到多台机器:
+§8.2.4 说明了差值法只能得到**往返**总和,无法拆成去程/回程。若后续确实需要单向数字,以下是完整的技术路径:
 
-- NTP 的典型精度是毫秒级,而本方案要测的段延迟是微秒级 —— **NTP 完全不够用**
-- PTP(IEEE 1588)可到微秒/亚微秒,但需要硬件时间戳支持的网卡与交换机
-- 退而求其次:只信任**同进程内的差值**与**跨进程的因果序**(happens-before),不信任跨机的绝对时间差
+**必要条件(缺一不可):**
 
-实用做法:在每跳的 TTHeader 中回填该跳的本地时间戳(即 Kitex 原生 `pcs/pce/pss/prs/pre` 的设计意图),用"每跳自报的内部耗时"拼装链路,而非用绝对时间相减。
+1. **PTP(IEEE 1588)** 而非 NTP —— NTP 毫秒级,与被测量同量级甚至更大
+2. **网卡硬件时间戳**(`SO_TIMESTAMPING` + `HWTSTAMP_TX_ON`/`RX_FILTER_ALL`)—— 软件时间戳会把内核调度延迟计入
+3. **交换机支持 PTP transparent clock 或 boundary clock** —— 否则交换机排队延迟会污染同步
+4. `ethtool -T <iface>` 确认网卡的时间戳能力
+
+**本环境的现状**:两机分别是 `enp33s0` 与 `eno1`,未验证是否支持硬件时间戳;且 suzhou950 当前连 NTP 都未开启。**在补齐上述条件之前,任何"单向延迟"数字都是编造的。**
+
+**折中方案**:用 `tcpdump --time-stamp-precision=nano` 在**两端同时抓包**,配合 TCP 序列号做包级配对。这仍受时钟偏斜影响,但可以用"同一台机器上看到的发包与收包时刻"约束住往返的组成部分,从而给出单向延迟的**区间估计**而非点估计。
+
+**本方案的立场**:报告中所有跨机数字一律标注"往返",不给单向点估计。这不是能力不足,是拒绝给出无法支撑的精度。
 
 ## 附录 C:关键源码位置索引
 
