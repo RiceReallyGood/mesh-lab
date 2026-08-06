@@ -1,0 +1,87 @@
+# 阶段 2:单跳降级模式的 Envoy 配置
+#
+#   kitex-client --UDS--> [本配置] --UDS--> kitex-server
+#
+# 目的是在引入跨机变量之前，先把 TTHeader transport、L7 路由、
+# 大小写保持这三件事验证掉。多机形态见 two-hop-*.yaml。
+
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 15000 }
+
+static_resources:
+  listeners:
+    - name: inbound_from_client
+      address:
+        # UDS。机内 sidecar 通信绕开整个 TCP/IP 栈（设计文档 §3.6）。
+        # mode 用八进制 0666，否则不同用户的进程连不上。
+        pipe:
+          path: /tmp/kitex-demo/out.sock
+          mode: 0666
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.thrift_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.thrift_proxy.v3.ThriftProxy
+                stat_prefix: kitex_out
+
+                # 本方案新增的 transport。Kitex 默认就发这个，
+                # 而 Envoy 原有的 HEADER 是 Apache THeader，与之不兼容（§3.1）。
+                transport: TTHEADER
+                protocol: BINARY
+
+                # 必须开。Http::LowerCaseString 会强制小写，而 metainfo 的
+                # 前缀是大写的（RPC_PERSIST_ 等）。不开则 Kitex 侧按大写前缀
+                # 匹配失败，metainfo 静默消失 —— 不报错、不告警（§9.1）。
+                # 该行为已由单测 TTHeaderMetainfoCaseTest 双向锁定。
+                header_keys_preserve_case: true
+
+                route_config:
+                  name: local_route
+                  routes:
+                    # 路由依据 1：TTHeader IntKV 的 ToService（id=6）。
+                    # 我们的 transport 把它映射成语义化 header 名 x-tt-to-service，
+                    # 于是 HeaderMatcher 直接可用 —— 这是「真 L7 而非 TCP 透传」
+                    # 最直接的证据：改 header 能改变 cluster 选择。
+                    - match:
+                        method_name: ""      # 空表示不按方法名过滤
+                        headers:
+                          - name: x-tt-to-service
+                            string_match: { exact: echo-server }
+                      route: { cluster: echo_backend }
+
+                    # 路由依据 2：Thrift 协议层的 method_name。
+                    # 与上一条来源不同（一个来自 transport 的 IntKV，
+                    # 一个来自 protocol 层解出的消息头），两条都验证才能说明
+                    # transport 与 protocol 两层都正确工作。
+                    - match: { method_name: Echo }
+                      route: { cluster: echo_backend }
+
+                access_log:
+                  - name: envoy.access_loggers.file
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                      path: /tmp/kitex-demo/envoy-access.log
+                      log_format:
+                        text_format_source:
+                          inline_string: "%START_TIME% %DURATION%ms method=%DYNAMIC_METADATA(thrift.proxy:method)% resp=%DYNAMIC_METADATA(thrift.proxy:response)% bytes_recv=%BYTES_RECEIVED% bytes_sent=%BYTES_SENT%\n"
+
+  clusters:
+    - name: echo_backend
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: echo_backend
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    pipe: { path: /tmp/kitex-demo/app.sock }
+      typed_extension_protocol_options:
+        envoy.filters.network.thrift_proxy:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.thrift_proxy.v3.ThriftProtocolOptions
+          # 上游用与下游相同的 transport/protocol。
+          # 不显式指定的话 Envoy 会沿用下游的，但写出来更清楚，
+          # 也便于后续做「下游 TTHeader、上游 Framed」这类协议转换实验。
+          transport: TTHEADER
+          protocol: BINARY
