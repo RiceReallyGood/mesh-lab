@@ -40,6 +40,16 @@ SESSION=meshxm
 BASE_OUT=11
 BASE_IN=12
 
+# KITEX_PROBE_DISABLE=1 时不给 Envoy 传探针环境变量，
+# 探针代码虽在二进制里但完全不激活 —— 这是 §8.6 的基线组。
+if [ "${KITEX_PROBE_DISABLE:-0}" = "1" ]; then
+  PROBE_OUT=""
+  PROBE_IN=""
+else
+  PROBE_OUT="KITEX_PROBE_HOST=suzhou950 KITEX_PROBE_PATH=$RUN/trace-envoy-out.ndjson KITEX_PROBE_NODE=envoy-out"
+  PROBE_IN="KITEX_PROBE_HOST=suzhou920B KITEX_PROBE_PATH=$PEER_RUN/trace-envoy-in.ndjson KITEX_PROBE_NODE=envoy-in"
+fi
+
 sync_peer() {
   echo "[同步] 推送二进制与配置到 $PEER"
   $SSH "$PEER" "mkdir -p ~/meshlab/bin ~/meshlab/conf $PEER_RUN" 2>/dev/null
@@ -63,7 +73,7 @@ start() {
       '$ULIMIT_CMD; KITEX_PROBE_HOST=suzhou920B ~/meshlab/bin/server -addr $PEER_RUN/app.sock -trace $PEER_RUN/trace-server.ndjson 2>&1 | tee $PEER_RUN/server.log'
     sleep 2
     tmux new-window -t $SESSION -n envoy-in \
-      '$ULIMIT_CMD; KITEX_PROBE_HOST=suzhou920B KITEX_PROBE_PATH=$PEER_RUN/trace-envoy-in.ndjson KITEX_PROBE_NODE=envoy-in ~/meshlab/bin/envoy-static -c ~/meshlab/conf/two-hop-in-remote.yaml --base-id $BASE_IN --log-level info 2>&1 | tee $PEER_RUN/envoy-in.log'
+      '$ULIMIT_CMD; $PROBE_IN ~/meshlab/bin/envoy-static -c ~/meshlab/conf/two-hop-in-remote.yaml --base-id $BASE_IN --log-level info 2>&1 | tee $PEER_RUN/envoy-in.log'
   " 2>/dev/null
   sleep 4
 
@@ -73,7 +83,7 @@ start() {
   tmux kill-session -t "$SESSION" 2>/dev/null
   tmux new-session -d -s "$SESSION"
   tmux new-window -t "$SESSION" -n envoy-out \
-    "$ULIMIT_CMD; KITEX_PROBE_HOST=suzhou950 KITEX_PROBE_PATH=$RUN/trace-envoy-out.ndjson KITEX_PROBE_NODE=envoy-out $ENVOY -c $CONF/two-hop-out-remote.yaml --base-id $BASE_OUT --log-level info 2>&1 | tee $RUN/envoy-out.log"
+    "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $CONF/two-hop-out-remote.yaml --base-id $BASE_OUT --log-level info 2>&1 | tee $RUN/envoy-out.log"
   sleep 3
 
   status
