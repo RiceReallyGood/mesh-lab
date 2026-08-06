@@ -1,0 +1,4 @@
+*.ndjson
+*.sock
+/build/
+/out/
