@@ -49,12 +49,25 @@
 
 **⑥ 是整个设计里最关键的一个点。** 没有它就无法把"本跳处理"与"等待下游"分开,归因会退化成只知道总时长。
 
+### ④→⑤ 的细分(已实现)
+
+原本 `route_resolved → up_write_done` 一段把三件事混在一起(实测 7～16 µs),
+现已拆开:
+
+| 点位 | 位置 | 含义 |
+|---|---|---|
+| `up_conn_new` / `up_conn_reused` | `UpstreamRequest::onPoolReady` | **上游连接是新建/排队得来,还是直接复用**。这让建连成本可以按请求归因,而不只是从 `cluster.*.upstream_cx_total` 看聚合值 |
+| `up_encode_done` | `encodeAndWrite` 中 `encodeFrame` 之后 | 帧编码完成 |
+| `up_socket_write_done` | `connection().write()` 之后 | 写 socket 完成 |
+
+为此给 `RequestOwner` 加了 `downstreamConnectionId()`,**带默认实现返回 0** ——
+`ShadowRouterImpl`(影子流量,不需要打点)因此不受影响。
+
 ### 已知缺口
 
-| 想测但目前测不了 | 需要什么 | 为什么还没做 |
-|---|---|---|
-| **连接池命中/新建** | `UpstreamRequest::onPoolReady`,需携带"是否新建连接" | `RequestOwner` 接口不暴露下游连接 id,插桩需要额外接口改动,比"一行插桩"侵入得多。当前可从 `cluster.*.upstream_cx_total` 聚合看到,只是不能按请求归因 |
-| **listener accept** | `Network::ConnectionImpl` 层 | 与 thrift_proxy 无关,属于连接级而非请求级;新建连接的成本已体现在 client 侧的 `client_conn_start/finish` |
+| 想测但目前测不了 | 为什么还没做 |
+|---|---|
+| **listener accept** | 属于连接级而非请求级;新建连接的成本已体现在 client 侧的 `client_conn_start/finish` 与上游侧的 `up_conn_new` |
 
 ---
 
@@ -71,14 +84,19 @@
 | `wait_read_start` / `wait_read_finish` | `codec/thrift/thrift.go:211,220` | 等待 payload 到齐 | **★ 实际等待对端的时间**;`read_start→wait_read_start` 是读 header,`wait_read` 区间才是等 body |
 | `server_handle_start` / `server_handle_finish` | `server/server.go:373,368` | 业务 handler 执行 | **业务逻辑耗时**。echo 场景实测仅 1 µs,便于把框架开销与业务开销分开 |
 
-### 已补充的自定义点(设计文档 §6.2,尚未实现)
+### 补充的自定义点(已实现,`kitex/pkg/stats/meshlab_events.go`)
 
-| 点位 | 为什么现有事件不够 |
-|---|---|
-| `TTHeaderEncodeStart/Finish` | 现有只有 `WriteStart/Finish`(整个写路径),看不到 header 编码本身的成本 —— 而这正是 mesh 场景要评估的 |
-| `PayloadCodecStart/Finish` | 把 thrift 序列化从 Write 中剥离 |
-| **`NetpollOnReadEnter`** | **epoll 唤醒的真实时刻**。现有 `ReadStart` 在 handler 内部记录,已经晚了;只有这个点能量出"数据到达内核 → Go 侧被唤醒"的延迟 |
-| `MWChainEnter/Exit` | 量中间件自身开销 |
+全部经 `DefineNewEvent` 注册,不占预定义槽位,不影响既有消费方。
+
+| 点位 | 位置 | 为什么现有事件不够 |
+|---|---|---|
+| **`mesh_first_byte`** | `DecodeMeta` 首次 `Peek` 返回后 | **最关键的一个**。`ReadStart` 记录于 `Read()` 入口,那时还没开始读,真正的阻塞等待埋在 `codec.Decode` 内部 —— 于是 `read_start→read_finish` 吞掉了整个网络等待(实测占 client 侧 96%),等于没有分解 |
+| `mesh_socket_read_start` | 阻塞 `Peek` 之前 | 与上一个配对,得到**纯粹的等待对端时间** |
+| **`mesh_netpoll_onread`** | `default_server_handler.go` `OnRead` 入口 | **epoll 唤醒后用户态的第一个可记录时刻**。与 `mesh_socket_read_start` 一起,把"唤醒→开始读"这一段单独剥出 |
+| **`mesh_socket_write_start/finish`** | `bufWriter.Flush()` 前后 | `WriteStart/Finish` 括住"编码+写"整段,**分不清是序列化慢还是 socket 慢**。Flush 才是真正触发 write 系统调用的地方 |
+| `mesh_hdr_decode_start/finish` | `ttHeaderCodec.decode` 前后 | TTHeader 解析耗时 |
+| `mesh_hdr_encode_start/finish` | Encode 的 header 段 | TTHeader 编码耗时;mesh 场景的核心成本项 |
+| `mesh_payload_codec_start/finish` | `encodePayload` 前后 | thrift 序列化耗时 |
 
 ---
 

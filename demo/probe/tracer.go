@@ -228,5 +228,9 @@ func allEvents() []namedEvent {
 		{stats.MeshPayloadCodecFinish, "mesh_payload_codec_finish"},
 		{stats.MeshHeaderEncodeStart, "mesh_hdr_encode_start"},
 		{stats.MeshHeaderEncodeFinish, "mesh_hdr_encode_finish"},
+		{stats.MeshNetpollOnRead, "mesh_netpoll_onread"},
+		{stats.MeshSocketWriteStart, "mesh_socket_write_start"},
+		{stats.MeshSocketWriteFinish, "mesh_socket_write_finish"},
+		{stats.MeshSocketReadStart, "mesh_socket_read_start"},
 	}
 }
