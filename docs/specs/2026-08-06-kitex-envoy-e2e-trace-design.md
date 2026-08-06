@@ -874,6 +874,7 @@ ulimit -n 65536
 
 | 选项 | 为什么 |
 |---|---|
+| **`--experimental_downloader_config`** | **最关键的一条**。不做 URL 重写,构建会卡在 Rust 工具链下载 5–10 小时。详见 §11.2 |
 | **不加 `--config=gcc` / `--config=clang`** | 前者要 `libstdc++.a`(该机没有),后者要 libc++(也没有)且本版本已无 `setup_clang.sh`。用默认自动探测工具链 |
 | `--output_base=/tmp/eob` | `/tmp` 是 690 G tmpfs,避免磁盘 IO 拖累 384 核 |
 | `--curses=no --color=no` | 否则日志被 `Computing main repo mapping` 反复覆盖,无法判断卡在哪个依赖 |
@@ -970,6 +971,77 @@ C++ 单测:用 Kitex 真实产生的 TTHeader 字节流(从 demo 抓取并固化
 **当前配置**:`--http_timeout_scaling=2.0`(低于 `.bazelrc:52` 默认的 6.0)+ `--experimental_repository_downloader_retries=10` + 外层 10 次重试循环,且**仅在识别为网络错误时才重试**(编译错误立即停止,避免浪费)。
 
 **仍未用上的退路**:`--distdir` 预下载(依赖清单在 `bazel/repository_locations.bzl`)。因开发机到 suzhou950 仅 ~150 KB/s,传输 GB 级 distdir 不现实,故此退路实际不可行;真正的退路是官方构建容器。
+
+### 11.2 真正的根因:两个特定域名极慢,必须做 URL 重写
+
+排查过程中反复出现"静默停滞":连接处于 `ESTABLISHED` 且收发队列均为 0,TCP 层看不出异常,只有读超时能打破。逐一实测各源后定位到**两个致命慢源**:
+
+| 域名 | 用途 | 从 suzhou950 实测 |
+|---|---|---|
+| `static.rust-lang.org` | Rust 工具链(Envoy 有 Rust 扩展,`rules_rust` 在 analysis 阶段就要解析工具链,绕不过) | **29.6 KB/s** |
+| `raw.githubusercontent.com` / `185.199.x` CDN | 多个 repository rule 拉取 | **完全超时** |
+
+Rust 工具链体积数百 MB,按 29.6 KB/s **需 5–10 小时**,这就是前三次构建"卡在依赖拉取"的真相 —— 不是 GitHub 不稳,是这一个包在拖。
+
+**解法:bazel `--experimental_downloader_config` 做 URL 重写。**
+
+`~/.bazelrc`:
+```
+build --experimental_downloader_config=/home/<user>/downloader.cfg
+```
+
+`downloader.cfg`:
+```
+rewrite static\.rust-lang\.org/(.*) rsproxy.cn/$1
+rewrite raw\.githubusercontent\.com/(.*) gh-proxy.com/https://raw.githubusercontent.com/$1
+rewrite objects\.githubusercontent\.com/(.*) gh-proxy.com/https://objects.githubusercontent.com/$1
+```
+
+镜像实测对比:
+
+| 原始源 | 速度 | 镜像 | 速度 | 倍数 |
+|---|---|---|---|---|
+| `static.rust-lang.org` | 29.6 KB/s | `rsproxy.cn` | **22 MB/s** | **750×** |
+| `raw.githubusercontent.com` | 超时 | `gh-proxy.com` | 0.93 s / 200 | — |
+
+加上 Rust 重写后立竿见影:依赖数一分钟内从卡了半小时的 86 冲到 **357**,首次进入 analysis 阶段。
+
+**安全性说明**:bazel 对每个外部依赖强制校验 sha256(取自 `repository_locations.bzl`),因此即便第三方镜像返回被篡改的内容,也会在校验阶段立刻失败,不会静默引入。这使得使用非官方镜像在此场景下是可接受的。
+
+**`rsproxy.cn` 的一个特性**:首次请求某文件可能返回 `504`(回源冷启动),重试即 `200`。因此 `--experimental_repository_downloader_retries` 必须 ≥ 2。
+
+### 11.3 排障方法论:如何识别"静默停滞"
+
+这类故障最难的是**症状与卡点不对应** —— 日志只显示 `Analyzing: ...`,不告诉你在等谁。有效的诊断序列:
+
+1. `ls /tmp/eob/external | wc -l` 定期采样 —— 依赖数不涨说明卡在拉取
+2. `ls -lt /tmp/eob/external | head` —— 最后落盘的是谁,下一个就是嫌疑人
+3. `ss -tnp state established | grep :443` —— **关键**。看是否有连接、连到哪个 IP
+   - 有 `ESTABLISHED` 且队列为 0 → 对端不发数据,是慢源
+   - 无任何连接 → 在重试退避里干等
+4. 反查 IP 归属(`185.199.x` = GitHub 静态 CDN,`140.82.x` = github.com 主站)
+5. 用 `curl -r 0-2000000 -w "%{speed_download}"` 分别实测原始源与候选镜像
+
+**只看 `ss ... state established` 会漏掉 `SYN_SENT`** —— 排查早期我就漏了一次,应当用 `ss -tan` 看全部状态。
+
+**验证重写是否真的生效**:看连接的对端 IP 归属。走 `gh-proxy.com` 时对端会是 Cloudflare 段(`172.64.x`);若仍是 `185.199.x`(GitHub 静态 CDN),说明规则没匹配上。这比看日志可靠 —— bazel 不会打印它实际请求的 URL。
+
+**两个容易误判的监控口径**:
+
+| 错误口径 | 为什么误导 | 正确口径 |
+|---|---|---|
+| 盯单个文件大小 | 该文件下完后转下一个,大小不再变,看起来像卡死 | `du -sm /tmp/eob/external` 看总量 |
+| 盯 `external` 下的**目录数** | 一个 repository rule 可能要下多个文件(如 `rules_buf_toolchains` 下有 buf、protoc-gen-buf-lint、protoc-gen-buf-breaking),期间目录数不变 | 总量 + `lsof` 看当前写入 fd |
+
+### 11.4 已排除的退路:官方构建容器
+
+曾考虑用 `envoyproxy/envoy-build-ubuntu` 官方构建镜像绕开环境问题,**经查证不可行**:
+
+1. **`registry-1.docker.io` 从 suzhou950 超时不可达**(实测 code=000),镜像根本拉不下来
+2. 该机 docker 版本为 **18.09.0**(2018 年),无 `buildx`、多架构 manifest 支持
+3. **更根本的是:该镜像只提供工具链,不提供依赖。** Envoy 的几百个外部依赖仍由 bazel 在构建时从网络拉取 —— 也就是说 §11.2 的三个慢源一个都躲不掉。Envoy 官方 CI 之所以快,靠的是 RBE 远程缓存,而非镜像本身
+
+而工具链问题我们已用"默认自动探测 + 不加 `--config`"绕过(§2.5 第 2 条),恰恰是容器唯一能帮上忙的部分。**结论:容器路线成本高、收益为零。**
 
 **关于第一条**:这是唯一可能推翻整体方案的风险,因此在实施第一步就验证,不拖到后期。
 
