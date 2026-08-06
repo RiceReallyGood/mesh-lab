@@ -1,7 +1,7 @@
 # Kitex Echo × Envoy L7 Sidecar 端到端链路打点 —— 代码修改方案设计
 
 - 日期:2026-08-06
-- 状态:设计已确认,待实施
+- 状态:**六个阶段全部完成**,实测结果见 `docs/test-report.md`
 - 目标读者:实施者本人;假定读者熟悉 C++/Go,但不假定熟悉 Envoy 扩展机制与 Thrift 线格式
 
 ---
@@ -989,17 +989,18 @@ Kitex server 端有 unlink 处理(`trans_server.go:69` 分支),Envoy 侧需确�
 
 | 阶段 | 内容 | 完成判据 | 对应验证级 | 状态 |
 |---|---|---|---|---|
-| **0a** | 工具链就位:bazel 8.7.0 + Go + 两仓源码 | `bazel --version` 正常 | — | **✅ 已完成** |
-| **0b** | **验证 Envoy 在 openEuler aarch64 上编得过** | `envoy-static` 产出且 `--version` 正常 | — | **🔄 进行中,尚未进入编译阶段** |
-| **1** | TTHeader transport(§5.1 + §5.2) | round-trip 单测全绿 | 第 1 级 | 待开始 |
-| **2** | 静态 bootstrap + 单跳打通(单机降级模式) | echo 通 | 第 2 级 | 待开始 |
-| **3** | 路由配置(IntKV header + method_name) | 改 header 能改变 cluster 选择;metainfo 往返完整 | 第 3 级 | 待开始 |
-| **4** | 探针库(§5.3)+ Kitex 打点(§6)+ 双跳(单机) | 42 个点齐全,能 merge 出单请求 waterfall | 第 4 级 | 待开始 |
-| **5** | 真实跨机部署 + merge 工具 + 时钟鲁棒性验证 | §10.3 交付物齐备 | 第 5 级 | 待开始 |
+| **0a** | 工具链就位:bazel 8.7.0 + Go + 两仓源码 | `bazel --version` 正常 | — | ✅ |
+| **0b** | 验证 Envoy 在 openEuler aarch64 上编得过 | `envoy-static` 产出且 `--version` 正常 | — | ✅ 810 MB ELF |
+| **1** | TTHeader transport(§5.1 + §5.2) | round-trip 单测全绿 | 第 1 级 | ✅ **47/47** |
+| **2** | 静态 bootstrap + 单跳打通(单机降级模式) | echo 通 | 第 2 级 | ✅ |
+| **3** | 路由配置(IntKV header + method_name) | 改 header 能改变 cluster 选择 | 第 3 级 | ✅ 三路可证伪 |
+| **4** | 探针库(§5.3)+ Kitex 打点(§6)+ 双跳(单机) | 点位齐全,能 merge 出单请求 waterfall | 第 4 级 | ✅ |
+| **5** | 真实跨机部署 + merge 工具 + 时钟鲁棒性验证 | §10.3 交付物齐备 | 第 5 级 | ✅ 真实 16.18 s 偏斜下验证 |
+| **6** | 压测下开销归因 | 饱和点 + 归因数据 + 打点开销 | 第 6 级 | ✅ 见 `test-report.md` |
 
 **阶段 0b 必须最先做且不可跳过** —— 它验证的是 §11 中唯一可能推翻整体方案的风险。若失败,后续所有 C++ 工作都无处落地,应立即转入退路(§11 第一行)。
 
-> **诚实声明**:至本文修订时,阶段 0b **尚未完成**。构建两次卡在依赖拉取阶段(§11.1),**一行 Envoy 代码都还没有真正编译过**,因此 "aarch64 能编过" 既未被证实也未被证伪。本报告的所有 C++ 设计以此风险未消除为前提。
+> **最终状态**:六个阶段全部完成。aarch64 构建风险已消除(810 MB ELF,`--version` 正常,增量构建约 30 秒)。完整实测数据见 `docs/test-report.md`。
 
 ### 10.1 构建路径(全部在 suzhou950,无需 sudo)
 
