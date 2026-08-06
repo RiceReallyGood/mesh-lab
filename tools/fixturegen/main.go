@@ -36,6 +36,10 @@ type Case struct {
 	TotalBytes int               `json:"total_bytes"`
 	Hex        string            `json:"hex"`
 	ShouldFail bool              `json:"should_fail"` // C++ 侧应当拒绝
+
+	// 跳过「用 Kitex 官方解码器解回来」的自检。
+	// 仅用于我们刻意比 Kitex 宽容的用例（如 compact）。
+	SkipSelfDecode bool `json:"skip_self_decode"`
 }
 
 func mustEncode(p ttheader.EncodeParam, payload []byte) []byte {
@@ -65,6 +69,15 @@ func main() {
 	payload := thriftBinaryCall("Echo", 1)
 
 	cases := []*Case{
+		{
+			// 参数刻意与单测里手工推导的 kKitexBasicFrame 完全一致，
+			// 用来交叉验证「我对 encode.go 的理解」是否等于「Kitex 实际发出的字节」。
+			// 两者若不一致，说明手工推导有误 —— 这正是设置这个锚点的目的。
+			Name:    "HandDerivedAnchor",
+			Why:     "与单测中手工推导的权威帧参数一致，用于逐字节交叉验证",
+			Param:   ttheader.EncodeParam{SeqID: 1, ProtocolID: ttheader.ProtocolIDThriftBinary, IntInfo: map[uint16]string{6: "svc"}},
+			Payload: []byte{0x01, 0x02, 0x03, 0x04, 0x05},
+		},
 		{
 			Name: "Basic",
 			Why:  "最典型的 Kitex 请求：ThriftBinary + 路由用的 IntKV + 一个 StrKV",
@@ -154,7 +167,11 @@ func main() {
 		},
 		{
 			Name: "CompactProtocol",
-			Why:  "ProtocolID=0x02 应映射到 Envoy 的 Compact 而非报错",
+			Why: "ProtocolID=0x02 应映射到 Envoy 的 Compact 而非报错。" +
+				"注意：Kitex 自己的解码器拒绝 0x02（metakey 注释里的 'Kitex not support' 是字面意思），" +
+				"所以本用例跳过自解码自检 —— 我们的 Envoy 实现刻意比 Kitex 宽容，" +
+				"因为代理可能面对非 Kitex 的 TTHeader 实现，而 Envoy 的 Compact 解析本身是正确的",
+			SkipSelfDecode: true,
 			Param: ttheader.EncodeParam{
 				SeqID:      8,
 				ProtocolID: ttheader.ProtocolIDThriftCompact,
@@ -222,8 +239,10 @@ func main() {
 		}
 		out = append(out, c)
 
-		// 自检：用官方解码器解回来，确认我们生成的帧本身是合法的
-		if !c.ShouldFail {
+		// 自检：用官方解码器解回来，确认我们生成的帧本身是合法的。
+		// 这一步是「用官方编码器生成 fixture」价值的一部分 —— 它能发现
+		// 手工构造字节永远发现不了的问题（compact 那一例正是这么暴露的）。
+		if !c.ShouldFail && !c.SkipSelfDecode {
 			dp, err := ttheader.DecodeFromBytes(context.Background(), frame)
 			if err != nil {
 				panic(fmt.Sprintf("%s: 自解码失败 %v", c.Name, err))

@@ -1,0 +1,215 @@
+[
+  {
+    "name": "ACLToken",
+    "why": "InfoIDACLToken(0x11) 分支，写法与普通 StrKV 不同(无 count 字段)",
+    "seq_id": 7,
+    "flags": 0,
+    "protocol_id": 0,
+    "int_info": {},
+    "str_info": {
+      "RPC_TRANSIT_gdpr-token": "tok-abc",
+      "normal": "v"
+    },
+    "header_len": 42,
+    "payload_len": 17,
+    "total_bytes": 59,
+    "hex": "00000037100000000000000700070000110007746f6b2d61626301000100066e6f726d616c000176000080010001000000044563686f0000000100",
+    "should_fail": false,
+    "skip_self_decode": false
+  },
+  {
+    "name": "Basic",
+    "why": "最典型的 Kitex 请求：ThriftBinary + 路由用的 IntKV + 一个 StrKV",
+    "seq_id": 1,
+    "flags": 0,
+    "protocol_id": 0,
+    "int_info": {
+      "3": "echo-client",
+      "6": "echo-server",
+      "9": "Echo"
+    },
+    "str_info": {
+      "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    },
+    "header_len": 130,
+    "payload_len": 17,
+    "total_bytes": 147,
+    "hex": "0000008f1000000000000001001d0000010001000b7472616365706172656e74003730302d34626639326633353737623334646136613363653932396430653065343733362d303066303637616130626139303262372d30311000030003000b6563686f2d636c69656e740006000b6563686f2d736572766572000900044563686f80010001000000044563686f0000000100",
+    "should_fail": false,
+    "skip_self_decode": false
+  },
+  {
+    "name": "CompactProtocol",
+    "why": "ProtocolID=0x02 应映射到 Envoy 的 Compact 而非报错。注意：Kitex 自己的解码器拒绝 0x02（metakey 注释里的 'Kitex not support' 是字面意思），所以本用例跳过自解码自检 —— 我们的 Envoy 实现刻意比 Kitex 宽容，因为代理可能面对非 Kitex 的 TTHeader 实现，而 Envoy 的 Compact 解析本身是正确的",
+    "seq_id": 8,
+    "flags": 0,
+    "protocol_id": 2,
+    "int_info": {
+      "6": "svc"
+    },
+    "str_info": {},
+    "header_len": 26,
+    "payload_len": 17,
+    "total_bytes": 43,
+    "hex": "000000271000000000000008000302001000010006000373766380010001000000044563686f0000000100",
+    "should_fail": false,
+    "skip_self_decode": true
+  },
+  {
+    "name": "EmptyKV",
+    "why": "没有任何 info block，只有 PROTOCOL ID + NUM TRANSFORMS，验证最小 header",
+    "seq_id": 2,
+    "flags": 0,
+    "protocol_id": 0,
+    "int_info": {},
+    "str_info": {},
+    "header_len": 18,
+    "payload_len": 17,
+    "total_bytes": 35,
+    "hex": "0000001f100000000000000200010000000080010001000000044563686f0000000100",
+    "should_fail": false,
+    "skip_self_decode": false
+  },
+  {
+    "name": "HandDerivedAnchor",
+    "why": "与单测中手工推导的权威帧参数一致，用于逐字节交叉验证",
+    "seq_id": 1,
+    "flags": 0,
+    "protocol_id": 0,
+    "int_info": {
+      "6": "svc"
+    },
+    "str_info": {},
+    "header_len": 26,
+    "payload_len": 5,
+    "total_bytes": 31,
+    "hex": "0000001b100000000000000100030000100001000600037376630102030405",
+    "should_fail": false,
+    "skip_self_decode": false
+  },
+  {
+    "name": "IntKVOnly",
+    "why": "只有 IntKV 没有 StrKV，验证 info block 类型分发",
+    "seq_id": 3,
+    "flags": 0,
+    "protocol_id": 0,
+    "int_info": {
+      "6": "svc",
+      "9": "M"
+    },
+    "str_info": {},
+    "header_len": 34,
+    "payload_len": 17,
+    "total_bytes": 51,
+    "hex": "0000002f10000000000000030005000010000200060003737663000900014d00000080010001000000044563686f0000000100",
+    "should_fail": false,
+    "skip_self_decode": false
+  },
+  {
+    "name": "KitexProtobufMustReject",
+    "why": "§3.7：ProtocolID=0x04 必须显式拒绝，不能拿 thrift 解析器去啃 protobuf",
+    "seq_id": 9,
+    "flags": 0,
+    "protocol_id": 4,
+    "int_info": {
+      "6": "svc"
+    },
+    "str_info": {},
+    "header_len": 26,
+    "payload_len": 17,
+    "total_bytes": 43,
+    "hex": "000000271000000000000009000304001000010006000373766380010001000000044563686f0000000100",
+    "should_fail": true,
+    "skip_self_decode": false
+  },
+  {
+    "name": "MetainfoUppercase",
+    "why": "§9.1 大小写陷阱：metainfo 前缀是大写的，过一趟 Envoy 后必须原样还原",
+    "seq_id": 5,
+    "flags": 0,
+    "protocol_id": 0,
+    "int_info": {},
+    "str_info": {
+      "RPC_BACKWARD_LATENCY": "42",
+      "RPC_PERSIST_TENANT": "tenant-a",
+      "RPC_TRANSIT_HOP": "1"
+    },
+    "header_len": 98,
+    "payload_len": 17,
+    "total_bytes": 115,
+    "hex": "0000006f100000000000000500150000010003000f5250435f5452414e5349545f484f5000013100145250435f4241434b574152445f4c4154454e43590002343200125250435f504552534953545f54454e414e54000874656e616e742d6100000080010001000000044563686f0000000100",
+    "should_fail": false,
+    "skip_self_decode": false
+  },
+  {
+    "name": "PaddingZero_1",
+    "why": "header 长度恰为 4 的倍数 → Kitex 补 0 字节，而 Apache 实现会补 4 字节。抄错即偶发失败",
+    "seq_id": 1001,
+    "flags": 0,
+    "protocol_id": 0,
+    "int_info": {},
+    "str_info": {
+      "kx": "v"
+    },
+    "header_len": 26,
+    "payload_len": 17,
+    "total_bytes": 43,
+    "hex": "0000002710000000000003e90003000001000100026b7800017680010001000000044563686f0000000100",
+    "should_fail": false,
+    "skip_self_decode": false
+  },
+  {
+    "name": "PaddingZero_5",
+    "why": "header 长度恰为 4 的倍数 → Kitex 补 0 字节，而 Apache 实现会补 4 字节。抄错即偶发失败",
+    "seq_id": 1005,
+    "flags": 0,
+    "protocol_id": 0,
+    "int_info": {},
+    "str_info": {
+      "kxxxxx": "v"
+    },
+    "header_len": 30,
+    "payload_len": 17,
+    "total_bytes": 47,
+    "hex": "0000002b10000000000003ed0004000001000100066b787878787800017680010001000000044563686f0000000100",
+    "should_fail": false,
+    "skip_self_decode": false
+  },
+  {
+    "name": "PerfKeys",
+    "why": "§3.5 Kitex 原生 mesh 打点头，我们的 Envoy 要读写这些 key",
+    "seq_id": 6,
+    "flags": 0,
+    "protocol_id": 0,
+    "int_info": {},
+    "str_info": {
+      "pce": "1754438400123556789",
+      "pcs": "1754438400123456789",
+      "pss": "1754438400123656789"
+    },
+    "header_len": 98,
+    "payload_len": 17,
+    "total_bytes": 115,
+    "hex": "0000006f1000000000000006001500000100030003706373001331373534343338343030313233343536373839000370636500133137353434333834303031323335353637383900037073730013313735343433383430303132333635363738390080010001000000044563686f0000000100",
+    "should_fail": false,
+    "skip_self_decode": false
+  },
+  {
+    "name": "UnknownIntKey",
+    "why": "包含未在 metakey.go 定义的 IntKV id(999)，验证 C++ 侧 fallback 到 x-ttheader-int-999",
+    "seq_id": 4,
+    "flags": 0,
+    "protocol_id": 0,
+    "int_info": {
+      "6": "svc",
+      "999": "unknown-value"
+    },
+    "str_info": {},
+    "header_len": 46,
+    "payload_len": 17,
+    "total_bytes": 63,
+    "hex": "0000003b1000000000000004000800001000020006000373766303e7000d756e6b6e6f776e2d76616c756500000080010001000000044563686f0000000100",
+    "should_fail": false,
+    "skip_self_decode": false
+  }
+]

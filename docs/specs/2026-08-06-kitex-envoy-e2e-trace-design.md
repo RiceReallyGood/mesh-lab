@@ -800,6 +800,17 @@ RPC_PERSIST_ / RPC_TRANSIT_ / RPC_TRANSIT_UPSTREAM_ / RPC_BACKWARD_ / RPC_BACKWA
 
 **处理**:配置开启 `header_keys_preserve_case`,并在新 transport 中接上 formatter 的 `processKey()` / `format()`(Envoy 已有此机制,参见 `header_transport_impl.cc:136-137,156-158,238`)。
 
+**已实证(不再是推测)**:用 Kitex 官方编码器生成含 `RPC_PERSIST_TENANT` 等大写 key 的真实帧,做 decode → encode 往返:
+
+| `preserve_keys` | 往返结果 |
+|---|---|
+| `true`(即配置了 `header_keys_preserve_case`) | **逐字节保真** |
+| `false`(默认) | **失真** —— 大写前缀被改成小写 |
+
+机制上的原因:`MessageMetadata` 只在 `preserve_keys=true` 时才安装 `ThriftCaseHeaderFormatter`(`metadata.h:63`),没有 formatter 就没有原始大小写可还原。
+
+该行为已由单测 `TTHeaderMetainfoCaseTest.CaseIsLostWithoutPreserveKeys` **双向锁定**:既断言开启后保真,也断言关闭后必然失真。后者的意义在于 —— 如果哪天 Envoy 改了 header 大小写行为使得不开也能保真,这条测试会失败,提醒我们重新评估本节结论,而不是让一个过时的配置要求悄悄留在文档里。
+
 ### 9.2 padding 计算差异(偶发解析失败)
 
 见 §3.1 末尾的注。Apache 是 `4 - size%4`(整除时补 4 字节),Kitex 是 `(4 - size%4) % 4`(整除时补 0)。抄错只在 header 长度恰为 4 的倍数时触发,表现为低频偶发失败。
