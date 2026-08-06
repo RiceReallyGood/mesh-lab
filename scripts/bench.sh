@@ -84,40 +84,63 @@ stat_of() {  # stdin: 一行一个数
     }'
 }
 
+# 四组对照，**按轮次交错**执行。
+#
+# 为什么必须交错：把一组跑完再跑下一组（基线→A→B→C）时，
+# 任何随时间推进的系统性变化 —— 连接池预热、页缓存、CPU 频率、
+# 内核缓冲区状态 —— 都会系统性地偏袒靠后的组，这是顺序偏倚而非随机噪声。
+# 实测中曾出现「探针组比基线快 4.8%」这种物理上不可能的结果，
+# 正是顺序偏倚的表现。
+#
+# 交错后每组均匀分布在整个测试时段上，漂移被摊平到所有组。
 matrix() {
   local c=${1:-16}
-  echo "=== 打点开销四组对照（并发 c=$c，每组重复 $REPEAT 次）==="
-  echo "基线→A 隔离「插桩存在但不采样」的固定成本；"
-  echo "A→B 是实际归因配置的成本；B→C 显示采样率的影响。"
+  echo "=== 打点开销四组对照（并发 c=$c，$REPEAT 轮交错）==="
+  echo "每轮内依次跑四组，共 $REPEAT 轮；交错以消除顺序偏倚。"
   echo
 
-  local base_mid=""
-  for grp in "基线|1|0" "A_探针开_采样0|0|0" "B_探针开_采样1%|0|0.01" "C_探针开_采样100%|0|1.0"; do
-    local label=${grp%%|*}; local rest=${grp#*|}
-    local disable=${rest%%|*}; local rate=${rest#*|}
+  local groups=("基线|1|0" "A_探针开_采样0|0|0" "B_探针开_采样1%|0|0.01" "C_探针开_采样100%|0|1.0")
+  declare -A samples
 
-    if [ "$disable" = "1" ]; then
-      KITEX_PROBE_DISABLE=1 "$XM" start >/dev/null 2>&1
-    else
-      "$XM" start >/dev/null 2>&1
-    fi
-    sleep 3
+  for round in $(seq 1 "$REPEAT"); do
+    printf "  轮 %s/%s: " "$round" "$REPEAT"
+    for grp in "${groups[@]}"; do
+      local label=${grp%%|*}; local rest=${grp#*|}
+      local disable=${rest%%|*}; local rate=${rest#*|}
 
-    local samples=""
-    for _ in $(seq 1 "$REPEAT"); do
-      samples="$samples$(run_qps "$c" "$rate")"$'\n'
+      # 每组开跑前重启，保证探针开关状态正确；
+      # 重启带来的进程实例差异也因交错而被摊平。
+      if [ "$disable" = "1" ]; then
+        KITEX_PROBE_DISABLE=1 "$XM" start >/dev/null 2>&1
+      else
+        "$XM" start >/dev/null 2>&1
+      fi
+      sleep 2
+      local q
+      q=$(run_qps "$c" "$rate")
+      samples[$label]="${samples[$label]:-}$q"$'\n'
+      printf "%s " "${label%%_*}"
       sleep "$SETTLE"
     done
-    read -r mid lo hi <<< "$(echo "$samples" | grep -v '^$' | stat_of)"
-    [ -z "$base_mid" ] && base_mid=$mid
-    local delta
-    delta=$(awk -v m="$mid" -v b="$base_mid" 'BEGIN{printf "%+.1f%%", (m-b)/b*100}')
-    printf "%-20s QPS 中位=%-8s 最小=%-8s 最大=%-8s 相对基线=%s\n" \
-           "$label" "$mid" "$lo" "$hi" "$delta"
+    echo
   done
+
   echo
-  echo "判读：若某组的 [最小,最大] 区间与基线的区间重叠，"
-  echo "      则其差异落在噪声内，不能宣称存在开销。"
+  local base_mid=""
+  local base_lo="" base_hi=""
+  for grp in "${groups[@]}"; do
+    local label=${grp%%|*}
+    read -r mid lo hi <<< "$(echo "${samples[$label]}" | grep -v '^$' | stat_of)"
+    if [ -z "$base_mid" ]; then
+      base_mid=$mid; base_lo=$lo; base_hi=$hi
+    fi
+    local delta overlap
+    delta=$(awk -v m="$mid" -v b="$base_mid" 'BEGIN{printf "%+.1f%%", (m-b)/b*100}')
+    # 区间与基线重叠即判为「落在噪声内」
+    overlap=$(awk -v l="$lo" -v h="$hi" -v bl="$base_lo" -v bh="$base_hi" \
+      'BEGIN{print (l<=bh && bl<=h) ? "区间与基线重叠→落在噪声内" : "区间分离→效应可辨"}')
+    printf "%-20s 中位=%-8s [%s, %s]  %-7s %s\n" "$label" "$mid" "$lo" "$hi" "$delta" "$overlap"
+  done
 }
 
 case "${1:-sweep}" in

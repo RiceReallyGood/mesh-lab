@@ -48,7 +48,7 @@ func main() {
 		injectSkew = flag.String("inject-skew", "",
 			"人工注入时钟偏移，格式 node=±毫秒，如 kitex-server=+50。"+
 				"用于验证分析对时钟偏斜免疫：注入后各段时长应逐位不变")
-		format = flag.String("format", "waterfall", "输出格式: waterfall | chrome | summary")
+		format = flag.String("format", "waterfall", "输出格式: waterfall | detail | chrome | summary")
 		limit  = flag.Int("limit", 1, "最多输出几条 trace 的 waterfall")
 	)
 	flag.Parse()
@@ -106,6 +106,8 @@ func main() {
 		fmt.Printf("\n共 %d 条 trace，已显示 %d 条\n", len(ids), n)
 	case "summary":
 		printSummary(traces)
+	case "detail":
+		printDetail(traces)
 	case "chrome":
 		printChromeTrace(traces)
 	default:
@@ -387,4 +389,149 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+
+// ---------------------------------------------------------------------------
+// detail:逐段命名区间 + 跨节点分层分解
+//
+// waterfall 给的是「各点相对本节点起始的偏移」，读者要自己做减法；
+// summary 只给各节点总时长。两者都看不到「这一跳的时间具体花在哪个阶段」。
+// detail 直接把相邻点之间的区间命名并统计。
+// ---------------------------------------------------------------------------
+
+// phase 定义一个命名区间：从 from 点到 to 点。
+type phase struct {
+	node string
+	name string
+	from string
+	to   string
+}
+
+// 各节点内部的阶段划分。含义见 docs/probe-points.md。
+func phases() []phase {
+	return []phase{
+		// —— Envoy 每跳的内部阶段 ——
+		{"envoy-out", "①→② TTHeader解析", "dn_first_byte", "hdr_decoded"},
+		{"envoy-out", "②→③ 协议层解头", "hdr_decoded", "msg_begin"},
+		{"envoy-out", "③→④ 路由匹配", "msg_begin", "route_resolved"},
+		{"envoy-out", "④→⑤ 编码+连接+写出", "route_resolved", "up_write_done"},
+		{"envoy-out", "⑤→⑥ ★等待上游", "up_write_done", "up_first_byte"},
+		{"envoy-out", "⑥→⑦ 响应解码", "up_first_byte", "resp_decoded"},
+
+		{"envoy-in", "①→② TTHeader解析", "dn_first_byte", "hdr_decoded"},
+		{"envoy-in", "②→③ 协议层解头", "hdr_decoded", "msg_begin"},
+		{"envoy-in", "③→④ 路由匹配", "msg_begin", "route_resolved"},
+		{"envoy-in", "④→⑤ 编码+连接+写出", "route_resolved", "up_write_done"},
+		{"envoy-in", "⑤→⑥ ★等待上游", "up_write_done", "up_first_byte"},
+		{"envoy-in", "⑥→⑦ 响应解码", "up_first_byte", "resp_decoded"},
+
+		// —— Kitex client ——
+		{"kitex-client", "取连接", "client_conn_start", "client_conn_finish"},
+		{"kitex-client", "编码+发送", "write_start", "write_finish"},
+		{"kitex-client", "★等待响应体", "wait_read_start", "wait_read_finish"},
+		{"kitex-client", "★等待首字节", "write_finish", "mesh_first_byte"},
+		{"kitex-client", "TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
+		{"kitex-client", "payload解码", "mesh_payload_codec_start", "mesh_payload_codec_finish"},
+		{"kitex-client", "TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
+		{"kitex-client", "读取+解码(整段)", "read_start", "read_finish"},
+
+		// —— Kitex server ——
+		{"kitex-server", "★等待首字节", "rpc_start", "mesh_first_byte"},
+		{"kitex-server", "TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
+		{"kitex-server", "payload解码", "mesh_payload_codec_start", "mesh_payload_codec_finish"},
+		{"kitex-server", "TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
+		{"kitex-server", "读取+解码(整段)", "read_start", "read_finish"},
+		{"kitex-server", "★等待请求体", "wait_read_start", "wait_read_finish"},
+		{"kitex-server", "业务handler", "server_handle_start", "server_handle_finish"},
+		{"kitex-server", "编码+发送", "write_start", "write_finish"},
+	}
+}
+
+func printDetail(traces map[string][]Event) {
+	// 收集每个阶段的样本
+	samples := map[string][]int64{}
+	nodeTotal := map[string][]int64{}
+	nodeHost := map[string]string{}
+	ph := phases()
+
+	for _, events := range traces {
+		spans := groupByNode(events)
+		for _, s := range spans {
+			nodeTotal[s.Node] = append(nodeTotal[s.Node], s.Duration())
+			nodeHost[s.Node] = s.Host
+			at := map[string]int64{}
+			for _, ev := range s.Events {
+				// 同名点取最早一次，避免重试等场景重复
+				if _, ok := at[ev.Point]; !ok {
+					at[ev.Point] = ev.MonoNs
+				}
+			}
+			for _, p := range ph {
+				if p.node != s.Node {
+					continue
+				}
+				a, oka := at[p.from]
+				b, okb := at[p.to]
+				if oka && okb && b >= a {
+					key := p.node + "|" + p.name
+					samples[key] = append(samples[key], b-a)
+				}
+			}
+		}
+	}
+
+	fmt.Printf("样本数: %d 条 trace\n\n", len(traces))
+
+	// 1) 各节点内部阶段
+	lastNode := ""
+	for _, p := range ph {
+		key := p.node + "|" + p.name
+		v := samples[key]
+		if len(v) == 0 {
+			continue
+		}
+		if p.node != lastNode {
+			fmt.Printf("── %s [host=%s]  总时长 p50=%s\n", p.node, nodeHost[p.node],
+				durOf(nodeTotal[p.node], 0.50))
+			lastNode = p.node
+		}
+		sort.Slice(v, func(i, j int) bool { return v[i] < v[j] })
+		fmt.Printf("     %-22s p50=%-10s p90=%-10s p99=%-10s (n=%d)\n",
+			p.name, dur(pct(v, 0.50)), dur(pct(v, 0.90)), dur(pct(v, 0.99)), len(v))
+	}
+
+	// 2) 跨节点分层分解（差值法，§8.2.3）
+	fmt.Printf("\n── 跨节点分层分解（差值法，对时钟偏斜免疫）\n")
+	chain := [][2]string{
+		{"kitex-client", "envoy-out"},
+		{"envoy-out", "envoy-in"},
+		{"envoy-in", "kitex-server"},
+	}
+	for _, c := range chain {
+		outer, inner := nodeTotal[c[0]], nodeTotal[c[1]]
+		if len(outer) == 0 || len(inner) == 0 {
+			continue
+		}
+		sort.Slice(outer, func(i, j int) bool { return outer[i] < outer[j] })
+		sort.Slice(inner, func(i, j int) bool { return inner[i] < inner[j] })
+		// 用各自的 p50 相减：两项都在本机测得，偏斜抵消
+		diff := pct(outer, 0.50) - pct(inner, 0.50)
+		cross := ""
+		if nodeHost[c[0]] != nodeHost[c[1]] {
+			cross = "  [跨机→往返，不可拆单向]"
+		}
+		fmt.Printf("     %-14s − %-14s = %-10s%s\n", c[0], c[1], dur(diff), cross)
+	}
+	fmt.Printf("\n     解读：每项 = 外层节点自身处理 + 到内层节点的往返传输。\n")
+	fmt.Printf("     两项各自在本机用单调钟测量，相减时时钟偏斜完全抵消。\n")
+}
+
+func durOf(v []int64, q float64) string {
+	if len(v) == 0 {
+		return "NA"
+	}
+	s := append([]int64(nil), v...)
+	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	return dur(pct(s, q))
 }

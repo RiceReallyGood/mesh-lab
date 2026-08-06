@@ -218,5 +218,15 @@ func allEvents() []namedEvent {
 		{stats.WriteFinish, "write_finish"},
 		{stats.ServerHandleStart, "server_handle_start"},
 		{stats.ServerHandleFinish, "server_handle_finish"},
+
+		// 以下为本项目补充的细粒度事件（kitex pkg/stats/meshlab_events.go）。
+		// 目的是拆开 read_start→read_finish 这个吞掉 97% 时间的黑盒。
+		{stats.MeshFirstByte, "mesh_first_byte"},
+		{stats.MeshHeaderDecodeStart, "mesh_hdr_decode_start"},
+		{stats.MeshHeaderDecodeFinish, "mesh_hdr_decode_finish"},
+		{stats.MeshPayloadCodecStart, "mesh_payload_codec_start"},
+		{stats.MeshPayloadCodecFinish, "mesh_payload_codec_finish"},
+		{stats.MeshHeaderEncodeStart, "mesh_hdr_encode_start"},
+		{stats.MeshHeaderEncodeFinish, "mesh_hdr_encode_finish"},
 	}
 }
