@@ -22,7 +22,7 @@ BASE_IN=12
 start() {
   mkdir -p "$RUN"
   stop >/dev/null 2>&1
-  rm -f "$RUN"/*.sock "$RUN"/*.ndjson "$RUN"/*.log
+  rm -f "$RUN"/*.sock "$RUN"/*.ndjson* "$RUN"/*.log   # .ndjson* 而非 .ndjson：Envoy 探针按线程分文件，实际名字是 trace-xxx.ndjson.<tid>
 
   tmux new-session -d -s "$SESSION" 2>/dev/null || true
 

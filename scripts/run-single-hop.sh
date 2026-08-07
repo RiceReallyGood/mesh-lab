@@ -28,7 +28,7 @@ ENVOY_BASE_ID=${ENVOY_BASE_ID:-7}
 start() {
   mkdir -p "$RUN"
   stop >/dev/null 2>&1
-  rm -f "$RUN"/*.sock "$RUN"/*.ndjson "$RUN"/*.log
+  rm -f "$RUN"/*.sock "$RUN"/*.ndjson* "$RUN"/*.log   # .ndjson* 而非 .ndjson：Envoy 探针按线程分文件，实际名字是 trace-xxx.ndjson.<tid>
 
   tmux new-session -d -s "$SESSION" 2>/dev/null || true
 
@@ -38,8 +38,11 @@ start() {
   sleep 2
 
   echo "[2/3] envoy (监听 $RUN/out.sock, base-id=$ENVOY_BASE_ID)"
+  # 探针靠环境变量初始化，不设就完全不落盘 —— 而且不报错，
+  # 表现为「Envoy 一个点位都没有」，很容易误判成打点代码坏了。
+  # 双跳的两个脚本一直有这段，单跳漏了，2026-08-07 补上。
   tmux new-window -t "$SESSION" -n envoy \
-    "$ULIMIT_CMD; $ENVOY -c $CONF --log-level info --base-id $ENVOY_BASE_ID 2>&1 | tee $RUN/envoy.log"
+    "$ULIMIT_CMD; KITEX_PROBE_HOST=${KITEX_PROBE_HOST:-suzhou950} KITEX_PROBE_PATH=$RUN/trace-envoy.ndjson KITEX_PROBE_NODE=envoy $ENVOY -c $CONF --log-level info --base-id $ENVOY_BASE_ID 2>&1 | tee $RUN/envoy.log"
   sleep 4
 
   echo "[3/3] 检查"
