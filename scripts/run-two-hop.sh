@@ -55,11 +55,22 @@ stop() {
 }
 
 status() {
-  local ok=0
-  # socket 文件存在不等于有人 listen，必须用 ss 确认
-  ss -xln 2>/dev/null | grep -q "$RUN/app.sock" && echo "  app.sock      : 监听中" || { echo "  app.sock      : 未监听"; ok=1; }
-  ss -tln 2>/dev/null | grep -q ":15006"        && echo "  tcp :15006    : 监听中" || { echo "  tcp :15006    : 未监听"; ok=1; }
-  ss -xln 2>/dev/null | grep -q "$RUN/out.sock" && echo "  out.sock      : 监听中" || { echo "  out.sock      : 未监听"; ok=1; }
+  local ok=0 uds tcp
+  # socket 文件存在不等于有人 listen，必须用 ss 确认。
+  #
+  # 先把 ss 的输出收进变量，再用 here-string 交给 grep —— 不要写成
+  # `ss ... | grep -q ...`。本脚本开了 set -o pipefail，而 grep -q 命中第一行
+  # 就退出，ss 还在往管道里写就会吃到 SIGPIPE 死掉（rc=141），
+  # pipefail 取管道里最后一个非零码，于是整条管道返回 141，
+  # 明明在监听却被判成「未监听」。
+  # Envoy 的每个 worker 各自 SO_REUSEPORT bind 同一端口，384 worker 就是 384 行，
+  # 必然触发；而 worker 数少（如 ENVOY_CONCURRENCY=2）时 ss 写完就退了，碰不到。
+  # 这也是它藏了很久才被发现的原因。
+  uds=$(ss -xln 2>/dev/null)
+  tcp=$(ss -tln 2>/dev/null)
+  grep -qF -- "$RUN/app.sock" <<<"$uds" && echo "  app.sock      : 监听中" || { echo "  app.sock      : 未监听"; ok=1; }
+  grep -qF -- ":15006"        <<<"$tcp" && echo "  tcp :15006    : 监听中" || { echo "  tcp :15006    : 未监听"; ok=1; }
+  grep -qF -- "$RUN/out.sock" <<<"$uds" && echo "  out.sock      : 监听中" || { echo "  out.sock      : 未监听"; ok=1; }
   local n
   n=$(pgrep -u "$USER" -xc envoy-static 2>/dev/null || echo 0)
   echo "  envoy 进程数  : $n (应为 2)"

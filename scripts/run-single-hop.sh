@@ -58,11 +58,17 @@ stop() {
 }
 
 status() {
-  local ok=0
+  local ok=0 uds
   # 只看进程在不在是不够的 —— socket 文件存在也不代表有人 listen。
   # 用 ss -xln 确认真的在监听。
+  #
+  # 先收进变量再 grep，不要写成 `ss ... | grep -q ...`：本脚本开了
+  # set -o pipefail，grep -q 命中即退出会让 ss 吃 SIGPIPE（rc=141），
+  # pipefail 把 141 当成整条管道的退出码，于是在监听也报「未监听」。
+  # 详见 run-two-hop.sh 里 status() 的注释。
+  uds=$(ss -xln 2>/dev/null)
   for s in app.sock out.sock; do
-    if ss -xln 2>/dev/null | grep -q "$RUN/$s"; then
+    if grep -qF -- "$RUN/$s" <<<"$uds"; then
       echo "  $s : 正在监听"
     else
       echo "  $s : 未监听"; ok=1
