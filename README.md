@@ -14,21 +14,34 @@ Kitex RPC 经 Envoy 双跳 sidecar 的**端到端时延归因**实验。
 
 ## 这套东西能回答什么
 
-一条 40 µs 的 echo 请求端到端要 206 µs，多出来的 166 µs 在哪？实测拆解：
+**「上了 mesh 要多付多少钱？」** 直连 / 只加出向 sidecar / 完整双跳，三级跨机实测（p50，payload 64 B）：
 
-- **两跳 sidecar 自身处理只占 20.1%**，进程间传输占 65.3%（是前者的 3.2 倍）
-- 业务 handler 只有 **240 ns** —— 测的几乎全是框架与传输开销
-- Envoy 的 readv 系统调用 3.1 µs、Go 侧 goroutine 调度延迟 2.5 µs（p99 21 µs）
-  —— 这些此前都被笼统算作"等待对端"
+| | 端到端 | 比直连多 |
+|---|---:|---:|
+| 直连（无 mesh） | 147.3 µs | — |
+| 单跳（出向 sidecar） | 163.2 µs | **+15.9 µs**（+10.8 %） |
+| 双跳（完整 mesh） | 228.2 µs | **+80.9 µs**（**+54.9 %**） |
 
-完整结论见 [docs/test-report.md](docs/test-report.md)。
+几条不靠猜的结论：
+
+- **两跳严重不对称，入向比出向贵 4.1 倍**（65.0 vs 15.9 µs）。
+  但这**是机器不是路径** —— 把两个 Envoy 放同一台机器上，各阶段耗时逐项相等
+  （编码 5.0 vs 5.0 µs）。做了对照实验才敢这么说。
+- **加出向 sidecar 之所以便宜，是因为它替客户端省了钱**：客户端不再直接读跨机 TCP，
+  改读本机 UDS，**goroutine 调度延迟从 11.4 µs 降到 2.8 µs**，写 socket 从 7.8 µs 降到 1.8 µs。
+- 业务 handler 只有 **240 ns** —— 测的几乎全是框架与传输开销。
+- 「等待对端」不再是黑盒：拆成 *真等待 / poller 排队 / readv / 缓冲入队 / goroutine 调度* 五段。
+
+完整结论见 [docs/test-report.md](docs/test-report.md)，
+原始 merge 输出在 [docs/results/2026-08-07/](docs/results/2026-08-07/)。
 
 ## 从哪读起
 
 | 你想 | 看 |
 |---|---|
-| **动手跑起来** | [docs/runbook-operations.md](docs/runbook-operations.md) —— 构建→运行→采集→分析 |
-| 搭环境（镜像、代理、bazel 取舍） | [docs/runbook-build-environment.md](docs/runbook-build-environment.md) |
+| **第一次复现，从零到出数据** | [docs/runbook-reproduce.md](docs/runbook-reproduce.md) —— 假定网络已通，从下载 Go 一路到分析出图。每步都带 2026-08-07 全量复现的真实耗时与输出 |
+| 已跑通过，日常跑一轮实验 | [docs/runbook-operations.md](docs/runbook-operations.md) —— 构建→运行→采集→分析 |
+| 搭环境（镜像、代理、bazel 取舍）、网络排障 | [docs/runbook-build-environment.md](docs/runbook-build-environment.md) |
 | 看实测结论 | [docs/test-report.md](docs/test-report.md) |
 | 了解每个点位的含义 | [docs/probe-points.md](docs/probe-points.md) |
 | 知道**还有什么测不到** | [docs/probe-coverage-audit.md](docs/probe-coverage-audit.md) |
@@ -54,10 +67,22 @@ Kitex RPC 经 Envoy 双跳 sidecar 的**端到端时延归因**实验。
 demo/         Kitex 客户端与服务端，含 probe 包（Tracer + 落盘）
 tools/merge/  把各节点 NDJSON 合并成时序视图并做归因分析
 tools/        fixturegen（造 TTHeader 测试向量）、udsdump
-envoy-conf/   五份 Envoy 配置：单跳、双跳（同机/跨机）
+envoy-conf/   六份 Envoy 配置：单跳（同机/跨机）、双跳（同机/跨机）
 scripts/      拓扑拉起、压测、构建环境辅助
 docs/         见上表
 ```
+
+**四种拓扑怎么拉起**：
+
+| 拓扑 | 命令 | 用途 |
+|---|---|---|
+| 直连（跨机） | `TOPO=direct ./scripts/run-cross-machine.sh start` | 归因基线：没有 mesh 时是多少 |
+| 单跳（跨机） | `TOPO=single ./scripts/run-cross-machine.sh start` | 只有出向 sidecar |
+| 双跳（跨机） | `./scripts/run-cross-machine.sh start` | 完整 mesh，真实拓扑 |
+| 同机降级 | `./scripts/run-single-hop.sh` / `run-two-hop.sh` / `run-direct.sh` | 只有一台机器时验证链路通不通 |
+
+**做归因阶梯必须用跨机的那三级**。同机跑双跳的话，每加一跳就多一组 Envoy 进程挤同一批
+CPU，三级的资源竞争程度不同，级差里混着 CPU 争抢，不能归给「多一跳」。
 
 ## 几个值得单独一提的设计点
 

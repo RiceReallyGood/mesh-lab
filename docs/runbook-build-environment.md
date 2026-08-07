@@ -542,6 +542,39 @@ udsdump -listen /tmp/kitex-demo/dump.sock -upstream /tmp/kitex-demo/app.sock
 | — | 配置 Xray 代理 | GitHub release **2.6 MB/s**,一分钟下 1.8 GB |
 | — | **首次进入编译阶段** | 报 `No space left on device` |
 | — | `df -i` 定位 | **inode 耗尽**,非空间不足 |
-| — | output_base 迁到 /home | 进行中 |
+| — | output_base 迁到 /home | 编译跑完,**首次产出 `envoy-static`** |
 
-**至本文撰写时,"openEuler aarch64 能否编译 Envoy" 仍未有定论** —— 编译确实开始了(见到 `Compiling xxx.cc` 成功执行),但被 inode 问题打断,尚未跑完。不能声称此风险已消除。
+## 结论:openEuler aarch64 能编译 Envoy —— 已定论
+
+> 本节曾写着「仍未有定论」。**2026-08-07 已证实,该风险不存在。**
+
+**2026-08-07 从零全量构建实测**(`~/bazel_out` 与 `~/.cache/bazel` 均清空后):
+
+```
+=== START Fri Aug  7 17:16:46 CST 2026 === cpus=384 nofile=65536
+########## ATTEMPT 1  已缓存依赖=0 ##########
+INFO: Analyzed target //source/exe:envoy-static (1571 packages loaded, 71777 targets configured).
+INFO: Elapsed time: 1018.943s, Critical Path: 423.59s
+INFO: 18572 processes: 7717 internal, 10853 linux-sandbox, 1 local, 1 worker.
+INFO: Build completed successfully, 18572 total actions
+=== EXIT=0 总耗时 17 分钟 ===
+-r-xr-xr-x. 1 f00620085 f00620085 810M bazel-bin/source/exe/envoy-static
+```
+
+| 指标 | 值 |
+|---|---|
+| 总耗时 | **17 分钟,一次通过,零重试** |
+| 关键路径 | 423.6 s —— **并行度再高也压不到 7 分钟以下** |
+| 总 action 数 | 18,572 |
+| 外部依赖 | **960 个全部现拉,无一超时** |
+| 产物 | 810 MB |
+| `~/bazel_out` | 65 GB |
+| `~/.cache/bazel` | 3.0 GB |
+
+**17 分钟这个数字来自 384 核。** 核数少的机器按比例放大：64 核约 1.5 小时，
+32 核约 3 小时，但都不会低于关键路径的 7 分钟。
+
+**本节前面所有排障内容仍然有效** —— 它们是「网络不达标时会遇到什么」的记录。
+网络达标时依赖拉取根本不是瓶颈（960 个依赖零阻塞），不达标时它是唯一的瓶颈。
+
+从零复现的完整步骤（含每步实测耗时）见 [runbook-reproduce.md](runbook-reproduce.md)。

@@ -19,8 +19,15 @@
 
 **建议：先做 L0，再做 L1。L2 只在你确实要评估"这块网卡对 mesh 场景的影响"时才做。**
 
-理由：端到端 206 µs 里跨机网络往返占 87.6 µs，其中真正属于网卡的部分是个位数微秒。
-L2 引入的 Envoy 处理（41.5 µs）和两次 UDS 传输（46.9 µs）会把网卡差异淹没在噪声里。
+理由（2026-08-07 跨机三级阶梯实测，c=1、64 B、p50）：
+
+| 拓扑 | 端到端 | 相对 L0 多出来的东西 |
+|---|---:|---|
+| 直连（≈L1） | **147.3 µs** | Kitex 框架 + 一次跨机往返 |
+| 双跳（L2） | **228.2 µs** | 再加两个 Envoy（自身 43.5 µs）+ 两段 UDS 往返 |
+
+**L2 比 L1 多出 80.9 µs（+55 %），而真正属于网卡的部分是个位数微秒** ——
+这 80.9 µs 会把网卡差异彻底淹没。用 `TOPO=direct` 跑 L1 能把 sidecar 影响完全去掉。
 
 ---
 
@@ -276,7 +283,9 @@ bazel 高并行会耗尽 inode，报错是 "No space left on device" 但 `df -h`
 
 **`--base-id` 必须不同** —— 相同 base-id 的实例会通过共享域套接字互相杀掉（热重启机制）。
 
-一键脚本：`mesh-lab/scripts/run-cross-machine.sh`
+一键脚本：`mesh-lab/scripts/run-cross-machine.sh`（默认 `TOPO=two`；
+`TOPO=direct` / `TOPO=single` 可拿到少一跳、少两跳的对照，
+评测网卡时用 `direct` 能把 sidecar 的影响完全去掉）
 
 ---
 
@@ -434,7 +443,7 @@ NDJSON 里不含业务数据，只有时间戳、点位名和 trace id。
 |---|---|---|
 | **trace 文件是空的 / 只有少量事件** | 事件缓冲在内存中，进程退出时才刷盘 | 用 `SIGTERM` 优雅停止，不要 `kill -9` |
 | **跨机分析结果荒谬（负数时延）** | 两台机器 `KITEX_PROBE_HOST` 相同，被误判为同机后做了跨机钟减法 | 两台必须设不同值。默认 hostname 在很多环境下都是 `localhost.localdomain` |
-| **`waterfall` 图时间轴错乱** | 两机时钟未同步（本项目实测曾差 16.34 秒） | 分析结论不受影响（差值法对偏斜免疫），仅视觉错乱。介意就配 NTP |
+| **`waterfall` 图时间轴错乱** | 两机时钟未同步（本项目实测 15~17 秒，随时间漂移） | 分析结论不受影响（差值法对偏斜免疫），仅视觉错乱。介意就配 NTP |
 | **传大文件卡死，小包正常** | MTU 黑洞（路径 MTU < 接口 MTU 且中间设备不回 ICMP） | `sysctl -w net.ipv4.tcp_mtu_probing=1`，见 §1.4 |
 | **bazel 报 "No space left on device" 但 df 显示有空间** | tmpfs inode 耗尽 | `df -i` 确认；`--output_base` 换到 ext4/xfs 分区 |
 | **Envoy 编译在 cel-cpp 失败** | 缺 `--cxxopt=-Wno-nullability-completeness` | 加上重跑 |

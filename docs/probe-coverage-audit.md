@@ -31,19 +31,28 @@
 
 ### 已覆盖
 
-| 阶段 | 由哪两点之差得出 | 实测量级 |
-|---|---|---|
-| TTHeader 解析（Envoy） | `dn_first_byte` → `hdr_decoded` | 3.2 / 4.7 µs |
-| 协议层解消息头 | `hdr_decoded` → `msg_begin` | 510 / 951 ns |
-| 路由匹配 | `msg_begin` → `route_resolved` | 530 ns / 1.0 µs |
-| 取上游连接 | `route_resolved` → `up_conn_*` | 1.9 / 4.1 µs |
-| 帧编码 | `up_conn_*` → `up_encode_done` | 4.9 / 7.4 µs |
-| 响应解码 | `up_first_byte` → `resp_decoded` | 4.4 / 7.0 µs |
-| TTHeader 编解码（Kitex） | `mesh_hdr_*_start/finish` | 0.69–1.9 µs |
-| payload 序列化 | `mesh_payload_codec_*` | 290 ns |
-| 业务 handler | `server_handle_start/finish` | 240 ns |
+实测取自 2026-08-07 跨机双跳、c=1、payload 64 B（`results/2026-08-07/two-lo-detail.txt`），
+Envoy 两个数字为 envoy-out(950) / envoy-in(920B)：
 
-覆盖是充分的——两跳 sidecar 自身处理只占端到端 20.1%，而这 20.1% 已被拆到微秒级。
+| 阶段 | 由哪两点之差得出 | 实测 p50 |
+|---|---|---|
+| TTHeader 解析（Envoy） | `dn_first_byte` → `hdr_decoded` | 2.9 / 4.7 µs |
+| 协议层解消息头 | `hdr_decoded` → `msg_begin` | 490 / 910 ns |
+| 路由匹配 | `msg_begin` → `route_resolved` | 470 / 860 ns |
+| 取上游连接 | `route_resolved` → `up_conn_*` | 1.6 / 3.5 µs |
+| 帧编码 | `up_conn_*` → `up_encode_done` | 4.8 / 7.5 µs |
+| 响应解码 | `up_first_byte` → `resp_decoded` | 4.2 / 7.0 µs |
+| TTHeader 解码（Kitex） | `mesh_hdr_decode_*` | 710 ns（client）/ 1.7 µs（server） |
+| TTHeader 编码（Kitex） | `mesh_hdr_encode_*` | 90 / 100 ns |
+| payload 序列化 | `mesh_payload_codec_*` | 300 / 470 ns |
+| 业务 handler | `server_handle_start/finish` | **220 ns** |
+
+覆盖是充分的——两跳 sidecar 自身处理只占端到端 **19.1 %**（43.5 / 228.2 µs），
+而这 19.1 % 已被拆到微秒级。
+
+> envoy-in 每一项都比 envoy-out 慢 1.6~2.4 倍。**那是机器不是路径** ——
+> 把两个 Envoy 放同一台机器跑同样参数，各阶段逐项相等（编码 5.0 vs 5.0 µs）。
+> 见 `test-report.md` §6。**看这张表时不要把它读成「入向解析更贵」。**
 
 ### 缺口
 
@@ -63,12 +72,22 @@ read/write 系统调用本身的耗时，以及围绕它的缓冲区管理。
 
 ### 已覆盖
 
-| 位置 | 点位 | 实测 |
+实测值取自 2026-08-07 跨机双跳、c=1、payload 64 B（`results/2026-08-07/two-lo-detail.txt`），
+两个数字分别是 950 侧 / 920B 侧：
+
+| 位置 | 点位 | 实测 p50 |
 |---|---|---|
-| Envoy 上游**接收** | `up_readv_start` → `up_readv_done` 🆕 | 待测 |
-| Envoy 上游**发送** | `up_encode_done` → `up_socket_write_done` | 270 / 690 ns |
-| netpoll **接收** | `mesh_np_readv_start` → `mesh_np_readv_done` 🆕 | 待测 |
-| Kitex **发送** | `mesh_socket_write_start` → `mesh_socket_write_finish` | 1.8 / 2.9 µs |
+| Envoy 上游**接收** | `up_readv_start` → `up_readv_done` | **3.5 / 6.3 µs** |
+| Envoy 上游**发送** | `up_encode_done` → `up_socket_write_done` | 290 / 710 ns |
+| netpoll **接收** | `mesh_np_readv_start` → `mesh_np_readv_done` | **2.5 µs**（仅客户端侧） |
+| Kitex **发送** | `mesh_socket_write_start` → `mesh_socket_write_finish` | 1.8 / 5.7 µs |
+
+> **接收比发送贵一个数量级**（Envoy 3.5 µs vs 290 ns）。`doRead` 内部是循环，
+> 反复 readv 直到 EAGAIN，所以是「N 次 readv + N 次 append」的总和，
+> 而发送侧一次 `writev` 就完事。这不是异常。
+>
+> 950 与 920B 的差距（3.5 vs 6.3 µs，2.9 倍）是**机器差异**，不是路径差异 ——
+> 见 `test-report.md` §6 的同机对照实验。
 
 ### 缺口：发送侧的不对称 ⚠️
 
@@ -109,11 +128,26 @@ LinkBuffer 链表整理 → `outputs()` 拼 iovec → `writev` → 写不完则�
 
 | 排队发生在哪 | 点位 | 为什么重要 |
 |---|---|---|
-| **Envoy 事件循环内** | `up_epoll_wake` → `up_readv_start` 🆕 | 低负载≈0，压测下随排队深度增长。**这一刀区分「Envoy 处理慢」和「Envoy 排不过来」** |
-| **netpoll 同批 epoll 事件内** | `mesh_np_epoll_wake` → `mesh_np_dispatch` 🆕 | 同上，Go 侧的对应物 |
-| **goroutine 调度延迟** | `mesh_np_trigger` → `mesh_first_byte` 🆕 | 数据已进 LinkBuffer，但 RPC goroutine 还没被调度起来。**GOMAXPROCS 不足或 P 竞争时这里会爆炸** |
+| **Envoy 事件循环内** | `up_epoll_wake` → `up_readv_start` | c=1 时 130 ns；**c=16 时 p90 15.5 µs / p99 41.5 µs**。**这一刀区分「Envoy 处理慢」和「Envoy 排不过来」** |
+| **netpoll 同批 epoll 事件内** | `mesh_np_epoll_wake` → `mesh_np_dispatch` | 190 ns ~ 1.1 µs，Go 侧的对应物 |
+| **goroutine 调度延迟** | `mesh_np_trigger` → `mesh_first_byte` | **跨机 TCP 11.4 µs / 本机 UDS 2.8 µs（4.1 倍）**。数据已进 LinkBuffer 但 RPC goroutine 还没被调度起来 |
 
 这三项是本轮最有价值的产出——它们是"负载升高时时延为什么变差"的直接答案，而此前只能看到总时延变大。
+
+**2026-08-07 实测补充**，两条读法上的教训：
+
+**① 排队必须看 p90/p99，不能看 p50。** c=16 时 Envoy 事件循环排队的 p50 仍只有 420 ns，
+但 p90 已到 15.5 µs、p99 到 41.5 µs。**排队是尾延迟现象不是中位数现象**，
+只看 p50 会得出「没有排队」的错误结论。
+
+**② `up_epoll_wake` 的取时位置一度是错的，且症状具有欺骗性。** 初版在 `onFileEvent`
+入口取当前时间，那已经在 libevent 派发之后，排队全没被覆盖。发现方式是
+**worker 从 384 压到 2、端到端劣化 5.1 倍时，这一段反而从 290 ns 降到 180 ns** ——
+读数与物理直觉反向才暴露问题。改取 `dispatcher.approximateMonotonicTime()`
+后同条件下是 21.0 / 91.9 µs。修正提交 `envoy@448c7f0f`。
+
+> **教训可迁移**：验证一个「排队」类点位是否真的埋对了位置，
+> 不能只看它有没有读数，要**主动制造排队然后看它是否单调变大**。
 
 ### 仍然缺的
 
@@ -141,7 +175,7 @@ LinkBuffer 链表整理 → `outputs()` 拼 iovec → `writev` → 写不完则�
 | 跨机网络往返 | envoy-out总 − envoy-in总 − envoy-out处理 |
 | envoy-in↔server UDS 往返 | envoy-in总 − server总 − envoy-in处理 |
 
-每一项都是两个各自在本机测得的时长相减，**对时钟偏斜免疫**（实测两机差 16.34 秒仍成立）。
+每一项都是两个各自在本机测得的时长相减，**对时钟偏斜免疫**（实测两机差 15.5 秒左右仍成立，且注入额外 50 秒偏移后输出逐字节不变）。
 
 ### 根本限制一：拆不出单向
 

@@ -5,7 +5,7 @@
 
 ---
 
-## 一、Envoy 侧(每跳 8 个点)
+## 一、Envoy 侧(骨架 8 个点 + 细分 6 个,每跳实际发射 15 个点位名)
 
 请求经过一个 Envoy sidecar 的完整路径:
 
@@ -70,17 +70,37 @@ readv 系统调用、事件循环调度。现已拆开:
 
 | 点位 | 位置 | 含义 |
 |---|---|---|
-| `up_epoll_wake` | `connection_impl.cc` `onFileEvent` 入口(仅读就绪) | **epoll 唤醒后用户态第一个可记录时刻**。⑤→这里才是真正的等待 |
+| `up_epoll_wake` | `connection_impl.cc` `onFileEvent`,取 **`dispatcher.approximateMonotonicTime()`** | **事件后端返回、尚未派发任何回调的那一瞬**。⑤→这里才是真正的等待 |
 | `up_readv_start` / `up_readv_done` | `connection_impl.cc` `transport_socket_->doRead()` 前后 | socket 收包。注意 `doRead` 内部是循环,会反复 readv 直到 EAGAIN,所以是「N 次 readv + N 次 append」的总和 |
+
+> **`up_epoll_wake` 取的是缓存值,不是「现在」——这一点很容易改错,改错了还看不出来。**
+>
+> 初版在 `onFileEvent` 入口取当前时间,是**错的**:那里已经在 libevent 派发到本连接
+> **之后**,于是 `up_epoll_wake → up_readv_start` 只剩几百纳秒的分支开销,恒定不变。
+>
+> **发现方式**:把 Envoy worker 从 384 压到 2、端到端劣化 5.1 倍,
+> 这一段**反而**从 290 ns 降到 180 ns —— 排队明明变严重了读数却变小,说明真正的排队
+> 全发生在这个点之前,完全没被覆盖。
+>
+> 改取 `approximateMonotonicTime`(由 `DispatcherImpl` 注册的 libevent check 回调
+> `updateApproximateMonotonicTime` 更新)之后,同样条件下 envoy-out 21.0 µs /
+> envoy-in 91.9 µs,**差两三个数量级**。顺带还省一次 `clock_gettime` ——
+> 这个值本来就是缓存好的。
+>
+> 修正提交 `envoy@448c7f0f`(2026-08-07)。
 
 由此得到:
 
-| 段 | 含义 | 价值 |
+| 段 | 含义 | 实测(双跳 envoy-out,p50) |
 |---|---|---|
-| ⑤ → `up_epoll_wake` | **纯等待**:对端处理 + 网络在途 + 内核协议栈到 epoll 就绪 | 156 µs 的绝大部分 |
-| `up_epoll_wake` → `up_readv_start` | **事件循环内排队** | ★ 低负载≈0,压测下随排队深度增长。**这一刀区分「Envoy 处理慢」与「Envoy 排不过来」** |
-| `up_readv_start` → `up_readv_done` | readv 系统调用 | |
-| `up_readv_done` → ⑥ | buffer 管理 + filter chain 派发 | |
+| ⑤ → `up_epoll_wake` | **纯等待**:对端处理 + 网络在途 + 内核协议栈到 epoll 就绪 | **177.4 µs**(占「等待上游」的 98 %) |
+| `up_epoll_wake` → `up_readv_start` | **事件循环内排队** | c=1 时 **130 ns**;c=16 时 p50 420 ns、**p90 15.5 µs、p99 41.5 µs** |
+| `up_readv_start` → `up_readv_done` | readv 系统调用 | 3.5 µs |
+| `up_readv_done` → ⑥ | buffer 管理 + filter chain 派发 | 150 ns |
+
+**「事件循环内排队」这一刀区分「Envoy 处理慢」与「Envoy 排不过来」。**
+读它必须看 p90/p99 —— **排队是尾延迟现象不是中位数现象**,低负载或只看 p50
+都会得出「没有排队」的错误结论。数据来源 `results/2026-08-07/two-{lo,hi}-detail.txt`。
 
 **绑定机制**:给 `Network::Connection` 加了带默认实现的
 `setKitexProbeDownstreamId` / `kitexProbeDownstreamId`,由 `UpstreamRequest::onPoolReady`
@@ -111,7 +131,7 @@ readv 系统调用、事件循环调度。现已拆开:
 | `write_start` / `write_finish` | `default_client_handler.go:49,52`<br>`default_server_handler.go:67,70` | 编码并写入 socket | **发送耗时**(含编码) |
 | `read_start` / `read_finish` | 同上 `:67,70` / `:98,100` | 读取并解码 | **接收耗时** |
 | `wait_read_start` / `wait_read_finish` | `codec/thrift/thrift.go:211,220` | 等待 payload 到齐 | **★ 实际等待对端的时间**;`read_start→wait_read_start` 是读 header,`wait_read` 区间才是等 body |
-| `server_handle_start` / `server_handle_finish` | `server/server.go:373,368` | 业务 handler 执行 | **业务逻辑耗时**。echo 场景实测仅 1 µs,便于把框架开销与业务开销分开 |
+| `server_handle_start` / `server_handle_finish` | `server/server.go:373,368` | 业务 handler 执行 | **业务逻辑耗时**。echo 场景实测仅 **220~240 ns**(三种拓扑下逐项一致),便于把框架开销与业务开销分开 |
 
 ### 补充的自定义点(已实现,`kitex/pkg/stats/meshlab_events.go`)
 
@@ -195,7 +215,10 @@ envoy-in 总
 | envoy-out 处理 + 跨机网络往返 | envoy-out总 − envoy-in总 | **跨机**,但两项各自在本机测,偏斜抵消 |
 | envoy-in 处理 + UDS 往返② | envoy-in总 − server总 | 同机(920B),精确 |
 
-**每一项都是"两个各自在本机测得的时长"相减**,因此对时钟偏斜免疫(§8.2.3)。本环境两机实测偏差 16.34 秒,该方法仍然成立。
+**每一项都是"两个各自在本机测得的时长"相减**,因此对时钟偏斜免疫(§8.2.3)。
+本环境两机墙钟实测偏差 **15.5 秒左右**(950 未启用 NTP,数值随时间漂移),该方法仍然成立 ——
+2026-08-07 用 `--inject-skew kitex-server=+50` 注入额外 50 秒偏移,
+`detail` 输出与不注入时**逐字节相同**(`results/2026-08-07/clock-skew-check.txt`)。
 
 ---
 
@@ -214,6 +237,36 @@ envoy-in 总
 
 **建议补上的**(按价值排序):
 
-1. **连接池命中标志** —— 建连是首请求延迟的主因(实测 2.3 ms),但目前只能从聚合 stats 看,不能按请求归因
-2. **`NetpollOnReadEnter`** —— 唯一能量出"内核收到数据 → Go 被唤醒"这一段的点
-3. TTHeader 编解码的独立区间 —— mesh 场景下这是核心成本项之一
+| # | 点位 | 状态 |
+|---|---|---|
+| 1 | **netpoll 写路径(writev 边界)** | **未实现,当前唯一的 P0**。见下 |
+| 2 | 连接池命中标志(客户端侧) | **部分完成** —— Envoy 侧已由 `up_conn_new`/`up_conn_reused` 覆盖;Kitex 客户端仍只有 `client_conn_start/finish`,看不出这次是新建还是复用 |
+| 3 | 中间件链开销 | 未实现。预计 1 µs 量级,demo 里测不出东西,迁真实业务前再做 |
+| 4 | 协议栈内部(网卡 → 内核 → socket) | 未实现。需 SO_TIMESTAMPING / eBPF,评测网卡时是唯一该看的部分,见 `probe-coverage-audit.md` §5 |
+
+> **以下两条在 2026-08-07 已完成,从"建议补上"移出:**
+>
+> - ~~`NetpollOnReadEnter` —— 唯一能量出"内核收到数据 → Go 被唤醒"这一段的点~~
+>   → 已实现。客户端由 §二·五 的 `mesh_np_*` 五点覆盖(并且拆得更细),
+>   服务端由 `mesh_netpoll_onread` 覆盖。实测客户端 goroutine 调度延迟
+>   跨机 TCP 11.4 µs / 本机 UDS 2.8 µs。
+> - ~~TTHeader 编解码的独立区间~~
+>   → 已实现,`mesh_hdr_encode_start/finish` 与 `mesh_hdr_decode_start/finish`。
+
+### 唯一的 P0:netpoll 写路径
+
+读路径已经拆开了,**写路径仍是一个黑盒**。实测各处「写 socket」的耗时:
+
+| 写 socket | p50(双跳,c=1) |
+|---|---:|
+| envoy-out(C++,本机 UDS) | **290 ns** |
+| kitex-client(Go,本机 UDS) | 1.8 µs |
+| kitex-server(Go,本机 UDS) | 5.7 µs |
+| kitex-client(Go,**跨机 TCP**,直连) | **7.8 µs** |
+
+已能解释的部分:**传输方式**(同为 Go client,跨机 TCP 是本机 UDS 的 4.3 倍)与
+**机器差异**(920B 比 950 慢 1.5~2.9 倍,见 test-report §6.1)。
+
+**仍无法回答的**:Go 的写路径里,`writev` 系统调用本身与 netpoll 的缓冲管理各占多少。
+这需要在 `ioread()` 的对偶位置插桩。**框架可以直接复用读路径那套**
+(`ReadProbe` 的原子槽位 + 单调不减的因果校验 + `Consistent` 标志),估计一天工作量。

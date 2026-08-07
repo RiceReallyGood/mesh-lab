@@ -2,6 +2,9 @@
 
 从零把整条链路跑起来并拿到时延归因数据的完整步骤。
 
+> **第一次跑请先看 [runbook-reproduce.md](runbook-reproduce.md)** —— 那份是从零装环境
+> 一路到出数据的完整复现手册，每步带真实耗时与输出。本文假定环境已就绪，是日常跑一轮实验用的。
+
 **本文只讲"怎么做"。** 相关的"为什么"分散在别处，需要时再点进去：
 
 | 想知道 | 看哪 |
@@ -171,6 +174,19 @@ cd ~/envoy_kitex/mesh-lab
 脚本会把 `envoy-static` 与 `server` 推到对端、起进程、检查监听状态。
 `collect` 把对端的 trace 拉回本机。
 
+**同一个脚本还提供归因阶梯的另外两级**（`TOPO` 默认 `two`）：
+
+```bash
+TOPO=direct ./scripts/run-cross-machine.sh start   # client ──────TCP──▶ server
+TOPO=single ./scripts/run-cross-machine.sh start   # client ▶ envoy-out ─TCP─▶ server
+./scripts/run-cross-machine.sh target              # 打印本级 client 该打的地址
+```
+
+三级都跨机、每级只多一个 sidecar，所以级差就是「加一个 sidecar 的净代价」。
+**做阶梯对照时必须给三级设同一个 `ENVOY_CONCURRENCY`**，否则线程规模差异会混进级差。
+**不要用同机的 `run-single-hop.sh` / `run-two-hop.sh` 做这个对照** ——
+同机每加一跳就多一组 Envoy 挤同一批 CPU，级差里混着 CPU 争抢。
+
 **可选：限制 Envoy worker 数**
 
 ```bash
@@ -296,7 +312,7 @@ raw = df[~df.trace_id.str.startswith("__")]    # 逐条数据
 
 ### 5.3 时钟偏斜自检
 
-本环境两台机器实测差 16.34 秒。分析用的是差值法（两个各自在本机测得的时长相减），
+本环境两台机器实测差 15~17 秒（随时间漂移，2026-08-07 实测 15.46 s）。分析用的是差值法（两个各自在本机测得的时长相减），
 对偏斜免疫。想验证就注入一个人工偏移，**各段时长应逐位不变**：
 
 ```bash

@@ -1,0 +1,130 @@
+# 拓扑=direct 负载=hi  三轮合并  ENVOY_CONCURRENCY=4  size=64B  每轮 20s
+# 各轮 client 自报：
+#   r1: 并发=16 时长=20.001s 请求=1272709 失败=0 QPS=63630 延迟 p50=216µs p90=285µs p99=855µs p999=2.562ms max=590.632ms 
+#   r2: 并发=16 时长=20s 请求=1373442 失败=0 QPS=68671 延迟 p50=209µs p90=272µs p99=680µs p999=2.749ms max=7.09ms 
+#   r3: 并发=16 时长=20.001s 请求=1286597 失败=0 QPS=64324 延迟 p50=222µs p90=286µs p99=862µs p999=2.73ms max=7.732ms 
+
+
+╔══ trace 0001c31433e6cba6 ══
+║  涉及 2 个节点，2 台主机（跨机，时长仅在同机内精确）
+║
+║ ▸ kitex-server     [host=suzhou920B]  本地区间 18.6µs
+║          0ns  mesh_netpoll_onread
+║        310ns  rpc_start
+║        750ns  read_start
+║        1.1µs  mesh_socket_read_start
+║        1.6µs  mesh_first_byte
+║        1.7µs  mesh_hdr_decode_start
+║        3.8µs  mesh_hdr_decode_finish
+║        4.8µs  wait_read_start
+║        5.5µs  wait_read_finish
+║        6.5µs  read_finish
+║        9.0µs  server_handle_start
+║        9.4µs  server_handle_finish
+║        9.8µs  write_start
+║       10.6µs  mesh_hdr_encode_start
+║       10.7µs  mesh_hdr_encode_finish
+║       10.9µs  mesh_payload_codec_start
+║       11.3µs  mesh_payload_codec_finish
+║       11.5µs  mesh_socket_write_start
+║       18.3µs  mesh_socket_write_finish
+║       18.4µs  write_finish
+║       18.6µs  rpc_finish
+║ ▸ kitex-client     [host=suzhou950]  本地区间 176.1µs
+║          0ns  rpc_start
+║        3.2µs  client_conn_start
+║        6.0µs  client_conn_finish
+║        8.1µs  write_start
+║        9.4µs  mesh_hdr_encode_start
+║        9.5µs  mesh_hdr_encode_finish
+║        9.6µs  mesh_payload_codec_start
+║       10.1µs  mesh_payload_codec_finish
+║       10.6µs  mesh_socket_write_start
+║       15.6µs  mesh_socket_write_finish
+║       15.9µs  write_finish
+║       16.0µs  read_start
+║       17.4µs  mesh_socket_read_start
+║      154.0µs  mesh_np_epoll_wake
+║      156.5µs  mesh_np_dispatch
+║      157.8µs  mesh_np_readv_start
+║      158.5µs  mesh_np_readv_done
+║      158.6µs  mesh_np_trigger
+║      163.4µs  mesh_first_byte
+║      163.4µs  mesh_hdr_decode_start
+║      165.6µs  mesh_hdr_decode_finish
+║      166.3µs  wait_read_start
+║      167.0µs  wait_read_finish
+║      170.4µs  read_finish
+║      176.1µs  rpc_finish
+║
+║ ⇄ 链路开销（往返，含两跳 sidecar 与网络）
+║     client 观测总时长   176.1µs
+║     server 观测处理时长 18.6µs
+║     ── 差值 ──────────  157.6µs
+║     跨机：此值为往返总和，无法拆分单向（§8.2.4）
+║     两项各自在本机用单调钟测量，相减时时钟偏斜抵消，
+║     因此该结果对任意大小的时钟差都成立。
+╚══
+
+╔══ trace 00038e8a197d05bb ══
+║  涉及 2 个节点，2 台主机（跨机，时长仅在同机内精确）
+║
+║ ▸ kitex-server     [host=suzhou920B]  本地区间 16.1µs
+║          0ns  mesh_netpoll_onread
+║        380ns  rpc_start
+║        690ns  read_start
+║        1.1µs  mesh_socket_read_start
+║        1.6µs  mesh_first_byte
+║        1.6µs  mesh_hdr_decode_start
+║        3.3µs  mesh_hdr_decode_finish
+║        4.2µs  wait_read_start
+║        4.8µs  wait_read_finish
+║        5.9µs  read_finish
+║        7.8µs  server_handle_start
+║        8.0µs  server_handle_finish
+║        8.4µs  write_start
+║        9.2µs  mesh_hdr_encode_start
+║        9.3µs  mesh_hdr_encode_finish
+║        9.4µs  mesh_payload_codec_start
+║        9.9µs  mesh_payload_codec_finish
+║       10.0µs  mesh_socket_write_start
+║       15.8µs  mesh_socket_write_finish
+║       16.0µs  write_finish
+║       16.1µs  rpc_finish
+║ ▸ kitex-client     [host=suzhou950]  本地区间 219.9µs
+║          0ns  rpc_start
+║        2.5µs  client_conn_start
+║        4.1µs  client_conn_finish
+║        6.2µs  write_start
+║        7.0µs  mesh_hdr_encode_start
+║        7.1µs  mesh_hdr_encode_finish
+║        7.2µs  mesh_payload_codec_start
+║        7.4µs  mesh_payload_codec_finish
+║        7.5µs  mesh_socket_write_start
+║       16.4µs  mesh_socket_write_finish
+║       16.5µs  write_finish
+║       16.6µs  read_start
+║       17.7µs  mesh_socket_read_start
+║      195.1µs  mesh_np_epoll_wake
+║      196.0µs  mesh_np_dispatch
+║      196.5µs  mesh_np_readv_start
+║      199.0µs  mesh_np_readv_done
+║      199.3µs  mesh_np_trigger
+║      205.6µs  mesh_first_byte
+║      205.7µs  mesh_hdr_decode_start
+║      209.0µs  mesh_hdr_decode_finish
+║      209.9µs  wait_read_start
+║      210.9µs  wait_read_finish
+║      215.6µs  read_finish
+║      219.9µs  rpc_finish
+║
+║ ⇄ 链路开销（往返，含两跳 sidecar 与网络）
+║     client 观测总时长   219.9µs
+║     server 观测处理时长 16.1µs
+║     ── 差值 ──────────  203.7µs
+║     跨机：此值为往返总和，无法拆分单向（§8.2.4）
+║     两项各自在本机用单调钟测量，相减时时钟偏斜抵消，
+║     因此该结果对任意大小的时钟差都成立。
+╚══
+
+共 39314 条 trace，已显示 2 条
