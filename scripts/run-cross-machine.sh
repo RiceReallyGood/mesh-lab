@@ -24,6 +24,13 @@ PEER_IP=192.168.25.51
 
 LOCAL_ROOT="$HOME/envoy_kitex"
 ENVOY="$LOCAL_ROOT/envoy/bazel-bin/source/exe/envoy-static"
+
+# Envoy 默认按 CPU 核数开 worker（本机 384 个）。核数远多于连接数时，
+# 每个 worker 一次 epoll 只拿到零星事件，「事件循环排队」这个点位恒为 ~290ns，
+# 测不出任何东西。要观察排队必须把 worker 压下来。
+ENVOY_CONCURRENCY=${ENVOY_CONCURRENCY:-}
+CONC_FLAG=""
+[ -n "$ENVOY_CONCURRENCY" ] && CONC_FLAG="--concurrency $ENVOY_CONCURRENCY"
 DEMO="$LOCAL_ROOT/mesh-lab/demo"
 CONF="$LOCAL_ROOT/mesh-lab/envoy-conf"
 RUN=/tmp/kitex-demo
@@ -73,7 +80,7 @@ start() {
       '$ULIMIT_CMD; KITEX_PROBE_HOST=suzhou920B ~/meshlab/bin/server -addr $PEER_RUN/app.sock -trace $PEER_RUN/trace-server.ndjson 2>&1 | tee $PEER_RUN/server.log'
     sleep 2
     tmux new-window -t $SESSION -n envoy-in \
-      '$ULIMIT_CMD; $PROBE_IN ~/meshlab/bin/envoy-static -c ~/meshlab/conf/two-hop-in-remote.yaml --base-id $BASE_IN --log-level info 2>&1 | tee $PEER_RUN/envoy-in.log'
+      '$ULIMIT_CMD; $PROBE_IN ~/meshlab/bin/envoy-static -c ~/meshlab/conf/two-hop-in-remote.yaml --base-id $BASE_IN $CONC_FLAG --log-level info 2>&1 | tee $PEER_RUN/envoy-in.log'
   " 2>/dev/null
   sleep 4
 
@@ -83,7 +90,7 @@ start() {
   tmux kill-session -t "$SESSION" 2>/dev/null
   tmux new-session -d -s "$SESSION"
   tmux new-window -t "$SESSION" -n envoy-out \
-    "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $CONF/two-hop-out-remote.yaml --base-id $BASE_OUT --log-level info 2>&1 | tee $RUN/envoy-out.log"
+    "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $CONF/two-hop-out-remote.yaml --base-id $BASE_OUT $CONC_FLAG --log-level info 2>&1 | tee $RUN/envoy-out.log"
   sleep 3
 
   status

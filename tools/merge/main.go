@@ -12,9 +12,11 @@ package main
 
 import (
 	"bufio"
+	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"sort"
 	"strings"
@@ -48,8 +50,9 @@ func main() {
 		injectSkew = flag.String("inject-skew", "",
 			"人工注入时钟偏移，格式 node=±毫秒，如 kitex-server=+50。"+
 				"用于验证分析对时钟偏斜免疫：注入后各段时长应逐位不变")
-		format = flag.String("format", "waterfall", "输出格式: waterfall | detail | chrome | summary")
-		limit  = flag.Int("limit", 1, "最多输出几条 trace 的 waterfall")
+		format = flag.String("format", "waterfall", "输出格式: waterfall | detail | table | chrome | summary")
+		limit  = flag.Int("limit", 1,
+			"最多输出几条 trace。table 格式下 <=0 表示全部（聚合行始终基于全量样本）")
 	)
 	flag.Parse()
 
@@ -108,6 +111,8 @@ func main() {
 		printSummary(traces)
 	case "detail":
 		printDetail(traces)
+	case "table":
+		printTable(traces, ids, *limit)
 	case "chrome":
 		printChromeTrace(traces)
 	default:
@@ -419,6 +424,12 @@ func phases() []phase {
 		{"envoy-out", "  编码", "up_conn_reused", "up_encode_done"},
 		{"envoy-out", "  写socket", "up_encode_done", "up_socket_write_done"},
 		{"envoy-out", "⑤→⑥ ★等待上游", "up_write_done", "up_first_byte"},
+		// ↓ 把上面那段「等待上游」拆开。⑤→epoll唤醒 才是真正在等，
+		//   其余三段是本进程自己的开销，此前全被算作等待。
+		{"envoy-out", "   ├ 纯等待(到epoll就绪)", "up_write_done", "up_epoll_wake"},
+		{"envoy-out", "   ├ ★事件循环排队", "up_epoll_wake", "up_readv_start"},
+		{"envoy-out", "   ├ readv系统调用", "up_readv_start", "up_readv_done"},
+		{"envoy-out", "   └ buffer+filter派发", "up_readv_done", "up_first_byte"},
 		{"envoy-out", "⑥→⑦ 响应解码", "up_first_byte", "resp_decoded"},
 
 		{"envoy-in", "①→② TTHeader解析", "dn_first_byte", "hdr_decoded"},
@@ -428,6 +439,10 @@ func phases() []phase {
 		{"envoy-in", "  编码", "up_conn_reused", "up_encode_done"},
 		{"envoy-in", "  写socket", "up_encode_done", "up_socket_write_done"},
 		{"envoy-in", "⑤→⑥ ★等待上游", "up_write_done", "up_first_byte"},
+		{"envoy-in", "   ├ 纯等待(到epoll就绪)", "up_write_done", "up_epoll_wake"},
+		{"envoy-in", "   ├ ★事件循环排队", "up_epoll_wake", "up_readv_start"},
+		{"envoy-in", "   ├ readv系统调用", "up_readv_start", "up_readv_done"},
+		{"envoy-in", "   └ buffer+filter派发", "up_readv_done", "up_first_byte"},
 		{"envoy-in", "⑥→⑦ 响应解码", "up_first_byte", "resp_decoded"},
 
 		// —— Kitex client ——
@@ -436,6 +451,14 @@ func phases() []phase {
 		{"kitex-client", "  写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
 		{"kitex-client", "★等待响应体", "wait_read_start", "wait_read_finish"},
 		{"kitex-client", "★等待对端(纯网络)", "mesh_socket_read_start", "mesh_first_byte"},
+		// ↓ netpoll 内部拆解。只在客户端可用（采样判定必须早于阻塞读，
+		//   服务端此刻还读不到 TTHeader 里的 traceparent，见 probe-points.md §2.5）。
+		//   横跨多轮读的快照在 netpoll 侧已被 Consistent 校验剔除，不会出现在这里。
+		{"kitex-client", "   ├ 纯等待(到epoll就绪)", "mesh_socket_read_start", "mesh_np_epoll_wake"},
+		{"kitex-client", "   ├ ★poller事件排队", "mesh_np_epoll_wake", "mesh_np_dispatch"},
+		{"kitex-client", "   ├ readv系统调用", "mesh_np_readv_start", "mesh_np_readv_done"},
+		{"kitex-client", "   ├ LinkBuffer入队", "mesh_np_readv_done", "mesh_np_trigger"},
+		{"kitex-client", "   └ ★goroutine调度延迟", "mesh_np_trigger", "mesh_first_byte"},
 		{"kitex-client", "TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
 		{"kitex-client", "payload解码", "mesh_payload_codec_start", "mesh_payload_codec_finish"},
 		{"kitex-client", "TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
@@ -541,4 +564,190 @@ func durOf(v []int64, q float64) string {
 	s := append([]int64(nil), v...)
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
 	return dur(pct(s, q))
+}
+
+// ───────────────────────── table 格式 ─────────────────────────
+//
+// 一行一条 trace，一列一个时间段，单位微秒。
+// 开头四行是全量样本的 avg / p50 / p90 / p99。
+//
+// 与 detail 的区别：detail 只给分位数，看不到单条请求内部各段的相关性
+// （比如「尾延迟那些请求，是卡在排队还是卡在网络」）。table 保留原始逐条数据，
+// 便于导进表格或 pandas 自己筛。
+
+// netCol 是一跳的单程传输时间估算。
+//
+// **两重不确定性，用之前必须知道。**
+//
+// 其一，它不是纯线路时间。内层节点的「总时长」从 dn_first_byte（数据到达该节点）
+// 起算，而请求在此之前还可能在 listener 队列、worker 队列里等过 —— 那段落在
+// 内层的测量区间之外，于是全被这个差值吸收进来。实测把 Envoy worker 从 384 压到 2，
+// 同机 UDS 的「单程」从 21µs 涨到 128µs：多出来的一百微秒是排队，不是传输。
+// 想看纯传输，只能在低负载、无排队时读这一列。
+//
+// 其二，差值法只能得到往返：
+//
+//	外层节点的「等待」 − 内层节点的总时长 = 往返传输时间
+//
+// 再除以 2 得单程，隐含假设是**去程与回程对称**。这个假设在同机 UDS 上
+// 基本成立，在跨机链路上不一定 —— 上下行路径、队列深度、网卡中断合并
+// 都可能不对称。要真正拆开单向，需要 PTP + 硬件时间戳网卡，
+// 那是物理限制，不是插桩能力问题（见 docs/probe-coverage-audit.md §4）。
+//
+// 单条 trace 上这个差值可能为负：外层的「等待」与内层的「总时长」是两次
+// 独立测量，各自有噪声，当往返时间本身很小时噪声会盖过它。
+// 聚合分位数不受影响，但逐条看时负值是正常的，不是 bug。
+type netCol struct {
+	name       string
+	outerNode  string
+	outerPhase string // 外层「等待下游」那一段的阶段名
+	innerNode  string // 内层节点，取其总时长
+}
+
+func netCols() []netCol {
+	return []netCol{
+		{"net.client↔envoy-out单程(UDS)", "kitex-client", "★等待对端(纯网络)", "envoy-out"},
+		{"net.envoy-out↔envoy-in单程(跨机)", "envoy-out", "⑤→⑥ ★等待上游", "envoy-in"},
+		{"net.envoy-in↔server单程(UDS)", "envoy-in", "⑤→⑥ ★等待上游", "kitex-server"},
+	}
+}
+
+// colName 把阶段名清理成适合做表头的形式：去掉序号、树线、星号。
+func colName(node, phase string) string {
+	s := phase
+	for _, junk := range []string{"①→②", "②→③", "③→④", "④→⑤", "⑤→⑥", "⑥→⑦", "④→", "├", "└", "★"} {
+		s = strings.ReplaceAll(s, junk, "")
+	}
+	return node + "." + strings.TrimSpace(s)
+}
+
+func printTable(traces map[string][]Event, ids []string, limit int) {
+	ph := phases()
+	nc := netCols()
+
+	// 列顺序：节点总时长 → 各节点内部阶段 → 网络单程
+	var cols []string
+	seenNode := map[string]bool{}
+	for _, p := range ph {
+		if !seenNode[p.node] {
+			cols = append(cols, p.node+".总时长")
+			seenNode[p.node] = true
+		}
+		cols = append(cols, colName(p.node, p.name))
+	}
+	for _, c := range nc {
+		cols = append(cols, c.name)
+	}
+
+	// 逐条 trace 求值。缺列用 NaN 表示，聚合时跳过，输出时留空。
+	rows := make(map[string][]float64, len(traces))
+	for id, events := range traces {
+		vals := make([]float64, len(cols))
+		for i := range vals {
+			vals[i] = math.NaN()
+		}
+		idx := map[string]int{}
+		for i, c := range cols {
+			idx[c] = i
+		}
+
+		nodeTotal := map[string]int64{}
+		nodePhase := map[string]int64{} // node|phase → 时长
+		for _, s := range groupByNode(events) {
+			nodeTotal[s.Node] = s.Duration()
+			if i, ok := idx[s.Node+".总时长"]; ok {
+				vals[i] = float64(s.Duration()) / 1000
+			}
+			at := map[string]int64{}
+			for _, ev := range s.Events {
+				if _, ok := at[ev.Point]; !ok {
+					at[ev.Point] = ev.MonoNs
+				}
+			}
+			for _, p := range ph {
+				if p.node != s.Node {
+					continue
+				}
+				a, oka := at[p.from]
+				b, okb := at[p.to]
+				if oka && okb && b >= a {
+					nodePhase[p.node+"|"+p.name] = b - a
+					if i, ok := idx[colName(p.node, p.name)]; ok {
+						vals[i] = float64(b-a) / 1000
+					}
+				}
+			}
+		}
+
+		// 网络单程 = (外层等待 − 内层总时长) / 2
+		for _, c := range nc {
+			wait, okw := nodePhase[c.outerNode+"|"+c.outerPhase]
+			inner, oki := nodeTotal[c.innerNode]
+			if okw && oki {
+				vals[idx[c.name]] = float64(wait-inner) / 2 / 1000
+			}
+		}
+		rows[id] = vals
+	}
+
+	// 聚合行始终基于全量样本，与 -limit 无关。
+	agg := func(q float64, mean bool) []string {
+		out := make([]string, len(cols))
+		for i := range cols {
+			var v []float64
+			var sum float64
+			for _, r := range rows {
+				if !math.IsNaN(r[i]) {
+					v = append(v, r[i])
+					sum += r[i]
+				}
+			}
+			if len(v) == 0 {
+				out[i] = ""
+				continue
+			}
+			if mean {
+				out[i] = fmt.Sprintf("%.3f", sum/float64(len(v)))
+				continue
+			}
+			sort.Float64s(v)
+			k := int(float64(len(v)-1)*q + 0.5)
+			out[i] = fmt.Sprintf("%.3f", v[k])
+		}
+		return out
+	}
+
+	w := csv.NewWriter(os.Stdout)
+	defer w.Flush()
+
+	fmt.Printf("# 单位: 微秒(µs)。样本 %d 条 trace。\n", len(traces))
+	fmt.Printf("# 前四行为全量样本的聚合值，与 -limit 无关。\n")
+	fmt.Printf("# net.* = (外层等待 − 内层总时长) / 2。**不是纯线路时间**：内层总时长从 dn_first_byte 起算，\n")
+	fmt.Printf("#   此前在 listener/worker 队列里的等待落在测量区间之外，于是被算进了这一列。\n")
+	fmt.Printf("#   高负载下它以排队为主 —— 实测把 Envoy worker 从 384 压到 2，UDS 单程从 21µs 涨到 128µs。\n")
+	fmt.Printf("#   除以 2 还隐含「去程回程对称」的假设。单条为负属正常，见源码注释。\n")
+	fmt.Printf("# 注意分位数不可加：各列 p50 之和 ≠ 总时长 p50。\n")
+
+	_ = w.Write(append([]string{"trace_id"}, cols...))
+	_ = w.Write(append([]string{"__avg__"}, agg(0, true)...))
+	_ = w.Write(append([]string{"__p50__"}, agg(0.50, false)...))
+	_ = w.Write(append([]string{"__p90__"}, agg(0.90, false)...))
+	_ = w.Write(append([]string{"__p99__"}, agg(0.99, false)...))
+
+	n := limit
+	if n <= 0 || n > len(ids) {
+		n = len(ids)
+	}
+	for _, id := range ids[:n] {
+		rec := make([]string, 0, len(cols)+1)
+		rec = append(rec, id)
+		for _, v := range rows[id] {
+			if math.IsNaN(v) {
+				rec = append(rec, "")
+			} else {
+				rec = append(rec, fmt.Sprintf("%.3f", v))
+			}
+		}
+		_ = w.Write(rec)
+	}
 }
