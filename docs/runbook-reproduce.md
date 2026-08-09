@@ -913,6 +913,71 @@ grep -qF -- ":15006"        <<<"$tcp" && echo 监听中 || { echo 未监听; ok=
 （`grep -q`、`head -n`、`grep -m N`）组合，只要写端输出足够多就会假失败。
 自己写检查脚本时留意。
 
+#### 7.3.2 第二个脚本 bug：`stop()` 的顺序会丢掉小验证轮的全部数据（2026-08-09 发现并修复）
+
+**症状**：同机直连跑 300 请求全部成功，但 `trace-server.ndjson` 是 **0 条**。
+而同样 300 请求的单跳/双跳却有 5901 条，看起来毫无规律。
+
+**根因在 `demo/probe/tracer.go` 的落盘设计**：
+
+```go
+w := bufio.NewWriterSize(f, 1<<20)   // 1 MB 缓冲
+tick := time.NewTicker(time.Second)  // 每秒 flush 一次
+```
+
+也就是说**刷盘只有两个触发条件：缓冲写满 1 MB，或者每秒的 Ticker 到点。**
+
+300 请求 18 毫秒就跑完，只产生约 6300 条事件 / 380 KB ——
+**两个条件一个都没触发，全部还在内存里。** 而压测轮跑 20–40 秒、几十万条事件，
+1 MB 缓冲被反复写满一直在落盘，所以**永远看不到这个问题**。
+
+实测把这个机制钉死了（同一份 300 请求的直连验证轮）：
+
+| 停止方式 | server 落盘 | `[probe]` 统计行 |
+|---|---:|---|
+| 跑完立刻 `tmux kill-session`（旧脚本） | **0 条** | 无 |
+| 跑完立刻 `pkill -TERM` | **346 / 1087 条**（每次不一样） | 无 |
+| **跑完等 1 秒再停** | **6300 条 = 6300 应有** | **有，`丢弃=0`** ✅ |
+
+两个杀法各自的问题：
+
+- **SIGHUP（`tmux kill-session` 拆 pane 时发的就是它）**：server 只注册了
+  SIGINT/SIGTERM 处理器，**不处理 SIGHUP**，默认动作直接终止，一条都写不出去。
+- **SIGTERM 也不保险**：处理器里是 `svr.Stop()` → `tr.Close()` → `os.Exit(0)`，
+  `tr.Close()` 要 `close(ch)` + `wg.Wait()` 等 writer goroutine 排空并 flush。
+  紧跟在压测后面发信号时这一串会和退出竞争，实测只落了 346 或 1087 条，**每次还不一样**。
+
+**修法**：四个 `run-*.sh` 的 `stop()` 改成**三步**——先给 Ticker 一秒，再 SIGTERM，最后拆 tmux：
+
+```bash
+stop() {
+  sleep 2                                     # ① 让每秒 Ticker 至少触发一次
+  pkill -u "$USER" -x envoy-static 2>/dev/null
+  pkill -u "$USER" -x server 2>/dev/null      # ② SIGTERM，走 tr.Close()
+  sleep 2
+  tmux kill-session -t "$SESSION" 2>/dev/null # ③ 最后才拆 tmux
+  sleep 1
+}
+```
+
+**完整性判据（比数行数可靠）**：`server.log` 里必须有这一行 ——
+
+```
+[probe] node=kitex-server 总请求=300 采样=300 丢弃=0
+```
+
+它是 `tr.Close()` 打印的。**这一行不在，就说明 Close() 没跑完，数据不可信**；
+`丢弃` 非 0 则说明 channel 满过（`emit` 是非阻塞投递，满了直接丢）。
+
+> **对本次复现结论的影响：无。** 归因阶梯用的是跨机的 20 秒压测轮
+> （每级 1.3–2 万条 trace），远超 1 MB 缓冲，一直在正常落盘；
+> 受影响的只有几百请求的**同机验证轮**，而那一级只用来判断链路通不通。
+
+**这条的通用价值**：凡是带缓冲的观测工具，**「什么时候刷盘」和「用什么信号停进程」
+共同决定数据完整性**，而两者都不会报错。tmux/screen 托管尤其容易踩 ——
+你以为在「关窗口」，实际是在给被观测进程发 SIGHUP。
+写观测工具时应该**同时**提供：定时刷盘、退出前 flush、以及一个可核对的完整性统计行。
+
 ### 7.4 跨机（真实拓扑，三级阶梯）
 
 ```bash
@@ -1277,6 +1342,7 @@ ssh 192.168.25.51 'rm -rf ~/meshlab /tmp/kitex-demo'
 | ssh 一断 Envoy 就没了 | Envoy 收到 SIGTERM 优雅退出 | 用 tmux 托管（§7.1） |
 | socket 文件在，但连不上 | 进程早死了 | `ss -xln \| grep kitex-demo` 才是真检查 |
 | trace 文件比预期少一截 | 最后一批还在内存，线程退出才刷盘 | 先 `stop` 再读；用 SIGTERM 不要 `kill -9` |
+| **小验证轮（几百请求）server 的 trace 是 0 条或残缺，大压测却正常** | 落盘只由「1 MB 缓冲写满」或「每秒 Ticker」触发。小批量 18 ms 跑完、只有 380 KB，两个条件都没触发，数据还在内存；此时杀进程就丢（SIGHUP 丢光，SIGTERM 也只剩几百条）。大压测缓冲反复写满，永远看不到 | 2026-08-09 已修：`stop()` 改成先 `sleep 2` 让 Ticker 触发、再 SIGTERM、最后拆 tmux。**用 `server.log` 里的 `[probe] ... 丢弃=0` 判完整性，别数行数**（§7.3.2） |
 | 明明跑了却一条数据都没有 | 在进程运行时 `rm` 过 trace 文件 | §8.2 ② |
 | `*.ndjson` 匹配不到文件 | Envoy 按线程分文件，名字带 `.<tid>` | 用 `*.ndjson*` |
 | 跨机分析出负数时延 | 两机 `KITEX_PROBE_HOST` 相同 | 两台设不同值 |
