@@ -165,9 +165,14 @@ start() {
 }
 
 stop() {
-  tmux kill-session -t "$SESSION" 2>/dev/null
+  # 先等 Ticker 刷盘 → 再 SIGTERM → 最后拆 tmux。三步顺序都要紧，两端同样处理，
+  # 少一步会让小批量验证轮的打点数据静默丢失，详见 run-direct.sh 的同名函数注释。
+  sleep 2
   pkill -u "$USER" -x envoy-static 2>/dev/null
-  $SSH "$PEER" "tmux kill-session -t $SESSION 2>/dev/null; pkill -u \$USER -x envoy-static 2>/dev/null; pkill -u \$USER -x server 2>/dev/null" 2>/dev/null
+  $SSH "$PEER" "pkill -u \$USER -x envoy-static 2>/dev/null; pkill -u \$USER -x server 2>/dev/null" 2>/dev/null
+  sleep 2
+  tmux kill-session -t "$SESSION" 2>/dev/null
+  $SSH "$PEER" "tmux kill-session -t $SESSION 2>/dev/null" 2>/dev/null
   sleep 1
   echo "已停止两端"
 }

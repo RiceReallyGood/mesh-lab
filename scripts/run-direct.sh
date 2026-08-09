@@ -41,10 +41,23 @@ start() {
 }
 
 stop() {
-  tmux kill-session -t "$SESSION" 2>/dev/null
-  pkill -u "$USER" -x server 2>/dev/null
+  # 三步顺序都要紧，少一步就会**静默丢数据**（2026-08-09 实测定位）：
+  #
+  # 打点落盘由 probe/tracer.go 的 `bufio(1MB) + 每秒 Ticker` 驱动。
+  # 300 请求的验证轮 18 毫秒就跑完、只产生约 380 KB —— 两个刷盘条件一个都没触发，
+  # 事件全在缓冲里。此时：
+  #   · 先 tmux kill-session → SIGHUP（server 不处理它）→ 进程当场死 → 实测落盘 0 条
+  #   · 直接 SIGTERM 也不保险 → tr.Close() 与退出竞争 → 实测只剩 346 / 1087 条
+  #   · 先等 2 秒让 Ticker 触发一次 → 实测 6300/6300 条，丢弃=0 ✅
+  #
+  # 大压测感觉不到这个问题，因为 1MB 缓冲被反复写满、一直在落盘。
+  sleep 2                                    # ① 让每秒 Ticker 至少触发一次
+  pkill -u "$USER" -x server 2>/dev/null     # ② SIGTERM，走优雅退出 + tr.Close()
+  sleep 2
+  tmux kill-session -t "$SESSION" 2>/dev/null # ③ 最后才拆 tmux
   sleep 1
   echo "已停止"
+  # 完整性判据：server.log 里应有 `[probe] ... 丢弃=0`。**没有这一行就说明 Close() 没跑完，数据不可信。**
 }
 
 status() {
