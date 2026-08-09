@@ -42,7 +42,7 @@
 
 | 档位 | 你要做的事 | 需要搬运 | 体积 |
 |---|---|---|---|
-| **A（推荐）** | 只跑实验、出数据 | 4 个二进制 + 配置 + 脚本 | **约 855 MB** |
+| **A（推荐）** | 只跑实验、出数据 | 4 个二进制 + 配置 + 脚本 | 853 MB，**strip + zstd 后仅 31 MB**（§2.4） |
 | B | 还要改 Go 侧（demo/kitex/netpoll）重编 | A + Go 工具链 + vendor 目录 | +310 MB |
 | C | 还要改 Envoy 的 C++ 打点重编 | B + bazel + 依赖缓存 + Envoy 源码 | +3.3 GB 起，且有坑（§5） |
 
@@ -204,19 +204,118 @@ ls -lh /tmp/meshlab-offline.tgz
 ```
 
 **实测（2026-08-09，suzhou950）**：未压缩 **853 MB** → `tar czf` 后 **160 MB**，耗时 **21 秒**。
-压缩比接近 5:1，比预想的好——因为 810 MB 里有大量重复的符号表和只读数据。
 
-> 急着传可以用 `zstd -T0 -3` 代替 gzip（384 核上快一个数量级，体积相近）。
-> 传输本身走你们内网的任何途径都行（跳板机 scp、U 盘、内部制品库）。
+**160 MB 还是太大？先别急着换压缩算法 —— 那 810 MB 里 85% 是调试符号。** 见 §2.4。
 
 ### 2.3 内网机器上落地
 
 ```bash
-tar -xzf meshlab-offline.tgz -C ~/
+tar -xzf meshlab-offline.tgz -C ~/      # 精简包按 §2.4 换成对应的解压命令
 mv ~/meshlab-offline ~/meshlab
 cd ~/meshlab && sha256sum -c SHA256SUMS      # 必须全 OK
 ./bin/envoy-static --version                 # §1.4 的兼容性验证
 ```
+
+### 2.4 精简包：853 MB → 126 MB，压缩后 24 MB
+
+**适用场景：内网传输有大小上限**（常见是 100 MB）。
+
+#### 2.4.1 先看清 810 MB 里装的是什么
+
+```bash
+readelf -S -W envoy-static | ...    # 按 section 大小排序
+```
+
+实测前几大 section：
+
+| section | 大小 | 是什么 |
+|---|---:|---|
+| `.gdb_index` | **412.6 MB** | gdb 调试索引 |
+| `.debug_line` | **185.8 MB** | 行号调试信息 |
+| `.strtab` + `.symtab` | 77.9 MB | 符号表 |
+| **`.text`** | **58.6 MB** | **真正的可执行代码** |
+
+**调试信息占了 85%，代码只有 58.6 MB。** 所以第一刀砍在这里，而不是换压缩算法。
+
+#### 2.4.2 三步瘦身
+
+```bash
+# ① strip envoy-static：810 MB → 97 MB
+#    注意 bazel 产物是只读的，直接 strip 会报 Permission denied，
+#    用 install 复制一份可写的（install 会同时设好 755）
+E=$(readlink -f ~/envoy_kitex/envoy/bazel-bin/source/exe/envoy-static)
+install -m755 "$E" /tmp/envoy-static-slim
+strip --strip-all /tmp/envoy-static-slim
+
+# ② Go 侧加 -ldflags="-s -w"：44 MB → 29 MB
+export PATH=~/sdk/go/bin:$PATH
+cd ~/envoy_kitex/mesh-lab/demo
+CGO_ENABLED=0 go build -ldflags="-s -w" -o bin-slim/server ./server
+CGO_ENABLED=0 go build -ldflags="-s -w" -o bin-slim/client ./client
+cd ../tools/merge && CGO_ENABLED=0 go build -ldflags="-s -w" -o ../../demo/bin-slim/merge .
+
+# ③ 组包时用这些精简产物，然后挑一个压缩算法（见下表）
+tar -C /tmp -I 'xz -9 -T0' -cf /tmp/meshlab-slim.tar.xz meshlab-offline
+```
+
+单个二进制的前后对比（实测）：
+
+| 二进制 | 原 | 精简后 |
+|---|---:|---:|
+| `envoy-static` | 810 MB | **97 MB** |
+| `client` | 20.6 MB | 15 MB |
+| `server` | 19.4 MB | 14 MB |
+| `merge` | 3.0 MB | 2.1 MB |
+| **整包（未压缩）** | **853 MB** | **126 MB** |
+
+#### 2.4.3 压缩算法对比（都在精简包上实测，384 核）
+
+| 方案 | 体积 | 耗时 | 解压命令 |
+|---|---:|---:|---|
+| 原始 gzip 包（**未 strip**） | 159.8 MB | 21 s | — |
+| **strip + gzip** | **43.0 MB** | **6 s** | `tar -xzf` |
+| **strip + zstd -19 -T0** | **31.3 MB** | 11 s | `tar -I zstd -xf` |
+| **strip + xz -9 -T0** | **24.1 MB** | 47 s | `tar -xf`（GNU tar 自动识别） |
+
+**三个方案全部远低于 100 MB。** 注意看这张表的重点：
+
+> **瘦身的功劳几乎全在 strip（160 → 43 MB），换算法只是锦上添花（43 → 24 MB）。**
+> 如果只换压缩算法不 strip，xz 也只能把 160 MB 压到一百多 MB，仍然超限。
+
+**推荐 `zstd -19`**：31 MB，11 秒，解压也快。除非你的传输上限卡得特别死才用 xz
+（xz 压缩 47 秒、解压也明显慢于 zstd，换来 7 MB）。
+内网机器没有 `zstd` 的话就用 gzip，43 MB 一样够用。
+
+#### 2.4.4 代价：失去符号化的调试能力
+
+strip 掉的是 `.symtab` / `.debug_*` / `.gdb_index`，所以：
+
+- ❌ `perf` / `gdb` 看到的是地址不是 C++ 函数名，崩溃栈也没有符号
+- ✅ **打点功能完全不受影响** —— 10 个点位名是 `.rodata` 里的字符串字面量，不在符号表里
+- ✅ 运行行为、性能完全一致
+
+**所以：构建机上的那份未 strip 的 810 MB 原件不要删。** 需要剖析 Envoy 内部时在构建机上做，
+内网只放精简版跑实验。
+
+#### 2.4.5 精简包实跑验证（2026-08-09 实测）
+
+从 xz 包解压后直接跑同机单跳，**与完整版行为一致**：
+
+```
+sha256sum -c SHA256SUMS   →  bin/{envoy-static,client,server,merge} 全部 OK
+out.sock: 监听中
+[诊断] 实际传输协议 = TTHeader|Framed
+并发=1 时长=30ms 请求=300 失败=0 QPS=9806
+延迟 p50=82µs p90=101µs p99=207µs
+落盘: client 7500 / envoy 4096 / server 6300 条
+[probe] node=kitex-server 总请求=300 采样=300 丢弃=0      ← 完整性判据通过
+merge -format summary 正常输出
+```
+
+p50 82 µs 与完整版的 79–80 µs 在噪声范围内。**strip 不影响任何测量结果。**
+
+> 如果你的传输上限比 24 MB 还小，用 `split -b 20M meshlab-slim.tar.xz part-`
+> 切片传，收到后 `cat part-* > meshlab-slim.tar.xz` 合并，再核对 sha256。
 
 ---
 
@@ -501,7 +600,7 @@ crate 解析可能仍然联网。**建议先在构建机上做一次断网演练
 **内网机器上，从收到 tgz 到出数据：**
 
 ```bash
-# 1. 落地 + 验兼容
+# 1. 落地 + 验兼容（精简包用 tar -I zstd -xf 或 tar -xf *.tar.xz）
 tar -xzf meshlab-offline.tgz -C ~/ && mv ~/meshlab-offline ~/meshlab
 cd ~/meshlab && sha256sum -c SHA256SUMS && ./bin/envoy-static --version
 
