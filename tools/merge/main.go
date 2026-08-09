@@ -305,7 +305,7 @@ func printSummary(traces map[string][]Event) {
 	sort.Strings(names)
 
 	fmt.Printf("样本数: %d 条 trace\n\n", len(traces))
-	fmt.Printf("%-20s %10s %10s %10s %10s\n", "区间", "p50", "p90", "p99", "max")
+	fmt.Printf("%-20s %10s %10s %10s %10s %10s\n", "区间", "avg", "p50", "p90", "p99", "max")
 	for _, n := range names {
 		g := agg[n].gaps
 		if len(g) == 0 {
@@ -316,8 +316,8 @@ func printSummary(traces map[string][]Event) {
 		if n == "__link__" {
 			label = "链路开销(往返)"
 		}
-		fmt.Printf("%-20s %10s %10s %10s %10s\n", label,
-			dur(pct(g, 0.50)), dur(pct(g, 0.90)), dur(pct(g, 0.99)), dur(g[len(g)-1]))
+		fmt.Printf("%-20s %10s %10s %10s %10s %10s\n", label,
+			dur(mean(g)), dur(pct(g, 0.50)), dur(pct(g, 0.90)), dur(pct(g, 0.99)), dur(g[len(g)-1]))
 	}
 	if crossHost {
 		fmt.Printf("\n注：涉及跨机，「链路开销」为往返总和，不可拆分单向（§8.2.4）\n")
@@ -374,6 +374,26 @@ func pct(sorted []int64, q float64) int64 {
 		return 0
 	}
 	return sorted[int(float64(len(sorted)-1)*q)]
+}
+
+// mean 求算术平均。不要求输入有序。
+//
+// 为什么要和分位数并列看：
+//
+//   - avg 远大于 p50 说明分布右偏、尾部重（少数慢请求把均值拉高了）。
+//     只看 p50 会低估系统的实际负担，只看 avg 会被离群点误导。
+//   - **平均值可加，分位数不可加**（§9.3 ①）。各阶段 p50 之和 ≠ 总时长 p50，
+//     但各阶段 avg 之和 ≈ 总时长 avg（期望的线性性）。
+//     所以做「各段占比」这类加减法时，avg 才是数学上站得住的那个。
+func mean(v []int64) int64 {
+	if len(v) == 0 {
+		return 0
+	}
+	var sum int64
+	for _, x := range v {
+		sum += x
+	}
+	return sum / int64(len(v))
 }
 
 func dur(ns int64) string {
@@ -522,13 +542,13 @@ func printDetail(traces map[string][]Event) {
 			continue
 		}
 		if p.node != lastNode {
-			fmt.Printf("── %s [host=%s]  总时长 p50=%s\n", p.node, nodeHost[p.node],
-				durOf(nodeTotal[p.node], 0.50))
+			fmt.Printf("── %s [host=%s]  总时长 avg=%s p50=%s\n", p.node, nodeHost[p.node],
+				meanOf(nodeTotal[p.node]), durOf(nodeTotal[p.node], 0.50))
 			lastNode = p.node
 		}
 		sort.Slice(v, func(i, j int) bool { return v[i] < v[j] })
-		fmt.Printf("     %-22s p50=%-10s p90=%-10s p99=%-10s (n=%d)\n",
-			p.name, dur(pct(v, 0.50)), dur(pct(v, 0.90)), dur(pct(v, 0.99)), len(v))
+		fmt.Printf("     %-22s avg=%-10s p50=%-10s p90=%-10s p99=%-10s (n=%d)\n",
+			p.name, dur(mean(v)), dur(pct(v, 0.50)), dur(pct(v, 0.90)), dur(pct(v, 0.99)), len(v))
 	}
 
 	// 2) 跨节点分层分解（差值法，§8.2.3）
@@ -547,14 +567,26 @@ func printDetail(traces map[string][]Event) {
 		sort.Slice(inner, func(i, j int) bool { return inner[i] < inner[j] })
 		// 用各自的 p50 相减：两项都在本机测得，偏斜抵消
 		diff := pct(outer, 0.50) - pct(inner, 0.50)
+		// avg 同理相减。与 p50 不同的是**均值可加**，所以做占比/加总时用这一列
+		diffAvg := mean(outer) - mean(inner)
 		cross := ""
 		if nodeHost[c[0]] != nodeHost[c[1]] {
 			cross = "  [跨机→往返，不可拆单向]"
 		}
-		fmt.Printf("     %-14s − %-14s = %-10s%s\n", c[0], c[1], dur(diff), cross)
+		fmt.Printf("     %-14s − %-14s = avg %-10s p50 %-10s%s\n",
+			c[0], c[1], dur(diffAvg), dur(diff), cross)
 	}
 	fmt.Printf("\n     解读：每项 = 外层节点自身处理 + 到内层节点的往返传输。\n")
 	fmt.Printf("     两项各自在本机用单调钟测量，相减时时钟偏斜完全抵消。\n")
+	fmt.Printf("     做加减法/算占比请用 avg 列：均值可加，分位数不可加（§9.3 ①）。\n")
+}
+
+// meanOf 是 mean 的字符串封装，空切片返回 NA，与 durOf 对称。
+func meanOf(v []int64) string {
+	if len(v) == 0 {
+		return "NA"
+	}
+	return dur(mean(v))
 }
 
 func durOf(v []int64, q float64) string {
