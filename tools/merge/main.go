@@ -359,32 +359,37 @@ func printWaterfall(id string, events []Event, skew map[string]int64) {
 
 	printHostTimelines(spans)
 
-	// 差值法导出跨节点开销（§8.2.3）。
-	// 只用「各自在本机测得的时长」相减，时钟偏斜完全抵消。
-	var client, server *nodeSpan
-	for _, s := range spans {
-		switch s.Node {
-		case "kitex-client":
-			client = s
-		case "kitex-server":
-			server = s
-		}
-	}
+	// 本条 trace 的端到端分解。与 summary 用的是同一个 decompose()——
+	// 两处各写一遍迟早会算出对不上的两个数。
+	//
+	// 单条上不需要「只能用 avg」那条限制：这是一条具体请求的实际用时，
+	// 各段相加恰好等于端到端，不涉及分位数可加性。
 	fmt.Println("║")
-	if client != nil && server != nil {
-		gap := client.Duration() - server.Duration()
-		fmt.Printf("║ ⇄ 链路开销（往返，含两跳 sidecar 与网络）\n")
-		fmt.Printf("║     client 观测总时长   %s\n", dur(client.Duration()))
-		fmt.Printf("║     server 观测处理时长 %s\n", dur(server.Duration()))
-		fmt.Printf("║     ── 差值 ──────────  %s\n", dur(gap))
-		if client.Host != server.Host {
-			fmt.Printf("║     跨机：此值为往返总和，无法拆分单向（§8.2.4）\n")
-		}
-		fmt.Printf("║     两项各自在本机用单调钟测量，相减时时钟偏斜抵消，\n")
-		fmt.Printf("║     因此该结果对任意大小的时钟差都成立。\n")
-	} else {
-		fmt.Printf("║ ⇄ 缺少 client 或 server 侧数据，无法做差值归因\n")
+	rows, total, ok := decompose(spans)
+	if !ok {
+		fmt.Printf("║ ⇄ 链条不完整（需要 %v 四个节点齐全），无法分解\n", chainOrder)
+		fmt.Println("╚══")
+		return
 	}
+	fmt.Printf("║ ⇄ 本条 trace 的端到端分解（相加 = 端到端）\n")
+	var acc int64
+	for _, r := range rows {
+		acc += r.v
+		pct := float64(r.v) / float64(total) * 100
+		// 单条上的「往返」可能为负：它是两次独立测量之差，噪声足以翻号。
+		// 原样显示，不钳零 —— 钳了就看不出这条样本不该拿来单独下结论。
+		note := ""
+		if r.v < 0 {
+			note = "   ← 为负：两次测量之差的噪声，单条不可据此下结论"
+		}
+		fmt.Printf("║     %s %10s  %5.1f%%%s\n", padRight(r.label, 30), dur(r.v), pct, note)
+	}
+	fmt.Printf("║     %s %10s  %5s\n", padRight(strings.Repeat("─", 15), 30), strings.Repeat("─", 8), "─────")
+	fmt.Printf("║     %s %10s\n", padRight("合计（= client 总时长）", 30), dur(acc))
+	if multiHost {
+		fmt.Printf("║     跨机那一段为往返总和，无法拆分单向（§8.2.4）。\n")
+	}
+	fmt.Printf("║     每段都由两个「各自在本机测得的时长」相减而来，时钟偏斜完全抵消。\n")
 	fmt.Println("╚══")
 }
 
@@ -468,6 +473,54 @@ var chainOrder = []string{"kitex-client", "envoy-out", "envoy-in", "kitex-server
 // 这是对旧 summary 的替代。旧表给的是各节点的观测区间，而那些区间是**嵌套**的
 // （client 套着 envoy-out，套着 envoy-in，套着 server），既不能相加也算不出占比，
 // 只能看量级。分解表是一个划分，能加到 100%。
+// decompRow 是端到端分解里的一段。
+type decompRow struct {
+	label string
+	v     int64
+}
+
+// decompose 把**一条 trace** 分解成「各节点自身 + 各段往返」，返回值相加等于端到端。
+//
+// 抽出来是为了让聚合视图（summary）与单条视图（waterfall 末尾）用同一套算法 ——
+// 两处各写一遍的话，迟早会算出对不上的两个数。
+//
+// 任一节点缺失或拿不到「等下一跳」的时间就返回 ok=false：分解是环环相扣的，
+// 缺一环后面全部对不上，不如整条不算。
+func decompose(spans []*nodeSpan) (rows []decompRow, total int64, ok bool) {
+	byNode := map[string]*nodeSpan{}
+	for _, s := range spans {
+		byNode[s.Node] = s
+	}
+	chain := []*nodeSpan{}
+	for _, n := range chainOrder {
+		s, has := byNode[n]
+		if !has {
+			return nil, 0, false
+		}
+		chain = append(chain, s)
+	}
+
+	for i, s := range chain {
+		if i == len(chain)-1 {
+			// 最后一跳（server）不等任何人，总时长就是它自己的处理
+			rows = append(rows, decompRow{s.Node + " 自身", s.Duration()})
+			break
+		}
+		w, has := waitOf(s)
+		if !has {
+			return nil, 0, false
+		}
+		next := chain[i+1]
+		rows = append(rows, decompRow{s.Node + " 自身", s.Duration() - w})
+		kind := "UDS"
+		if s.Host != next.Host {
+			kind = "跨机"
+		}
+		rows = append(rows, decompRow{fmt.Sprintf("%s往返 %s↔%s", kind, s.Node, next.Node), w - next.Duration()})
+	}
+	return rows, chain[0].Duration(), true
+}
+
 func printBreakdown(traces map[string][]Event) {
 	links := []*chainLink{}
 	idx := map[string]*chainLink{}
@@ -483,59 +536,14 @@ func printBreakdown(traces map[string][]Event) {
 	totals := []int64{}
 
 	for _, events := range traces {
-		spans := groupByNode(events)
-		byNode := map[string]*nodeSpan{}
-		for _, s := range spans {
-			byNode[s.Node] = s
-		}
-		// 链条上任一节点缺失就跳过这条 trace —— 分解是环环相扣的，
-		// 缺一环后面全部对不上，不如整条不算。
-		chain := []*nodeSpan{}
-		ok := true
-		for _, n := range chainOrder {
-			s, has := byNode[n]
-			if !has {
-				ok = false
-				break
-			}
-			chain = append(chain, s)
-		}
+		rows, total, ok := decompose(groupByNode(events))
 		if !ok {
-			continue
-		}
-
-		type row struct {
-			label string
-			v     int64
-		}
-		rows := []row{}
-		good := true
-		for i, s := range chain {
-			if i == len(chain)-1 {
-				// 最后一跳（server）不等任何人，总时长就是它自己的处理
-				rows = append(rows, row{s.Node + " 自身", s.Duration()})
-				break
-			}
-			w, has := waitOf(s)
-			if !has {
-				good = false
-				break
-			}
-			next := chain[i+1]
-			rows = append(rows, row{s.Node + " 自身", s.Duration() - w})
-			kind := "UDS"
-			if s.Host != next.Host {
-				kind = "跨机"
-			}
-			rows = append(rows, row{fmt.Sprintf("%s往返 %s↔%s", kind, s.Node, next.Node), w - next.Duration()})
-		}
-		if !good {
 			continue
 		}
 		for _, r := range rows {
 			get(r.label).samples = append(get(r.label).samples, r.v)
 		}
-		totals = append(totals, chain[0].Duration())
+		totals = append(totals, total)
 	}
 
 	fmt.Printf("样本数: %d 条 trace\n\n", len(traces))
@@ -793,7 +801,12 @@ func envoyPhases(node string) []phase {
 		{node, "③→④ 路由匹配", "msg_begin", "route_resolved"},
 		{node, "④→ 取上游连接", "route_resolved", "up_conn_reused"},
 		{node, "  编码", "up_conn_reused", "up_encode_done"},
-		{node, "  写socket", "up_encode_done", "up_socket_write_done"},
+		// **「写socket」只是入队**：ConnectionImpl::write() 做的是
+		// write_buffer_->move(data) + activateFileEvents，真正的 writev 在
+		// onWriteReady() 里由事件循环稍后执行。名字里写明，免得再被当成系统调用。
+		{node, "  写socket(仅入队)", "up_encode_done", "up_socket_write_done"},
+		{node, "  ↳ 入队→真正写出", "up_socket_write_done", "up_writev_start"},
+		{node, "  ↳ ★writev系统调用", "up_writev_start", "up_writev_done"},
 		{node, "⑤→⑥ ★等待上游", "up_write_done", "up_first_byte"},
 		// ↓ 把上面那段「等待上游」拆开。⑤→epoll唤醒 才是真正在等，
 		//   其余三段是本进程自己的开销，此前全被算作等待。

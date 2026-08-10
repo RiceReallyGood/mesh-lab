@@ -15,7 +15,7 @@
 | 类别 | 覆盖 | 最大缺口 |
 |---|---|---|
 | 各阶段处理时间 | 🟢 **好** | 中间件/filter 链内部不可分 |
-| socket 接口时间 | 🟡 **Go 侧收发已拆全；Envoy 发送侧只测到入队** | **Envoy 的 writev 没测** —— `write()` 只入队，真正的 writev 在 onWriteReady 里。所谓"Go 比 Envoy 贵 7–10 倍"是拿入队时间比系统调用时间，**结论已作废** |
+| socket 接口时间 | 🟢 **四方向都拆到系统调用**（Go 收发 + Envoy 上游收发） | **下游 writev 采不到**（绑定已释放）。另：所谓"Go 比 Envoy 贵 7–10 倍"**已作废** —— 同机同传输实测 3.2 vs 3.1 µs |
 | 排队时间 | 🟡 **本轮从零到部分覆盖** | 内核 accept 队列、TCP 发送缓冲区阻塞、服务端 goroutine 池 |
 | 链路上的时间 | 🔴 **只能得往返，且看不见 socket 以下的一切** | **网卡、驱动、协议栈、softirq 全部不可见** |
 
@@ -128,14 +128,49 @@ ioHandle().activateFileEvents(Event::FileReadyType::Write); // 激活写事件
 `mesh_np_flush_done`，两侧都有。慢路径（部分写）**没有拆开**，
 由 attrs 里的 `waited=true` 标出，分析时按需过滤。
 
-### 现在真正的发送侧缺口：Envoy 的 writev 没测 ⚠️
+### ~~现在真正的发送侧缺口：Envoy 的 writev 没测~~ —— 同日补齐
 
-要跟 Go 侧公平对比，得在 `ConnectionImpl::onWriteReady()` →
-`transport_socket_->doWrite()` 前后加一对点位。结构与 `up_readv_start/done`
-完全对称，读侧已经这么做了。
+在 `ConnectionImpl::onWriteReady()` 的 `transport_socket_->doWrite()` 前后加了
+`up_writev_start/done`（按 side 选 `up_`/`dn_`，与读路径同构）。
 
-**在补上之前，任何「Go 写 socket 比 Envoy 慢」的说法都不要再提** ——
-现有数据不支持这个结论，两边量的根本不是一回事。
+**注意 `onWriteReady` 每条 trace 会触发多次**：第 1 次是真正的请求发送，
+之后是缓冲区已排空后的空写（实测 0.04~0.09 µs）。merge 取同名点最早一次，
+恰好取到对的那个；直接数事件数会被误导。
+
+### 结论：两边 writev 是一个量级，旧结论彻底作废
+
+**同机同传输的干净对比（920B，两者都写 UDS）**：
+
+| | writev 系统调用 |
+|---|---:|
+| kitex-server（Go，UDS） | **3.2 µs** |
+| envoy-in 上游（C++，UDS） | **3.1 µs** |
+
+**基本一致。** 950 上 Go client 写 UDS 1.9 µs、envoy-out 写跨机 TCP 3.2 µs，
+传输不同不直接可比，但同样是一个量级。
+
+所谓「Go 侧写 socket 比 Envoy 贵 7–10 倍」是拿 Go 的**系统调用时间**
+去比 Envoy 的**入队时间**（270~690 ns），两边量的不是一回事。
+现在 Envoy 侧三段分开了：
+
+| 段 | envoy-out | envoy-in |
+|---|---:|---:|
+| 写socket(仅入队) | 300 ns | 770 ns |
+| 入队 → 真正写出（事件循环调度） | 1.4 µs | 2.6 µs |
+| **★ writev 系统调用** | **3.2 µs** | **3.1 µs** |
+
+「入队 → 真正写出」这一段是 Envoy 异步写模型的固有延迟，Go 的同步 Flush 没有
+对应物 —— 这才是两种模型的真实差别，而不是系统调用快慢。
+
+### 剩余缺口：下游 writev 采不到 ⚠️
+
+`dn_writev_*` 实测 **0 条**。原因是绑定生命周期：下游响应的
+`connection().write()` 只入队，真正的 writev 由事件循环稍后执行，
+而那时 `doDeferredRpcDestroy` 已经调过 `KITEX_PROBE_END` 释放了绑定，
+`rpcEvent` 查不到 trace 直接返回。
+
+要采到得把绑定活到下游写完为止，涉及绑定生命周期改造，有泄漏风险，**本轮没做**。
+影响有限：Go↔Envoy 的对比用上游那条已经成立，下游写的量级可参照上游。
 
 ### ~~缺口：服务端的 readv 完全没测~~ —— 2026-08-10 已补齐
 

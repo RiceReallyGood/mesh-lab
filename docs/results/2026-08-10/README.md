@@ -1,4 +1,4 @@
-# 2026-08-10 socket 边界补齐（Envoy 下游 + Go 收发两侧）—— merge 原始输出
+# 2026-08-10 socket 边界全部拆到系统调用 —— merge 原始输出
 
 这些是 `demo/bin/merge` 的**未经加工的输出**，直接 `cat` 即可。
 本轮的改动见 [`../../specs/2026-08-10-downstream-socket-probes-design.md`](../../specs/2026-08-10-downstream-socket-probes-design.md)。
@@ -40,8 +40,12 @@ two   client(950) ─UDS─▶ envoy-out(950) ──TCP:15006──▶ envoy-in(
 [probe] node=kitex-server 总请求=1000 采样=1000 丢弃=0
 ```
 
-逐条核对：client **1000×29**、envoy-out 1000×20、envoy-in 1000×20、**server 1000×30** 点位，
-共 **99000** 个事件，一条不缺。**判据是「记录==落盘 且 丢弃=0」，不是数行数。**
+逐条核对**去重后的点位名**：client 1000×29、envoy-out 1000×**22**、
+envoy-in 1000×**22**、server 1000×30，共 108998 个事件。
+
+> **Envoy 侧不能再数事件数了。** `onWriteReady()` 每条 trace 会触发多次
+> （第 1 次是真正的请求发送，之后是缓冲区已排空的空写），所以事件数是 24~30 不等，
+> 而**去重后的点位名恒为 22**。merge 取同名点最早一次，恰好取到对的那个。**判据是「记录==落盘 且 丢弃=0」，不是数行数。**
 
 服务端 21 → 30、客户端 25 → 29，来自 netpoll 读路径 5 点（仅服务端新增）与写路径 4 点（两侧新增）。
 
@@ -106,7 +110,38 @@ epoll 唤醒→readv→LinkBuffer→调度这一整段不可见，被算进了 U
 0/1 交错 3 轮、`-sample 0`）：均值 241.3 vs 239.0 µs，**开着比关着还「快」1.0%**，
 差异全在噪声内。
 
-## writev 拆开：一个长期结论被推翻
+## writev 全部拆到系统调用：一个长期结论被推翻
+
+Envoy 侧也补了 `up_writev_start/done`（`onWriteReady()` 里 `doWrite()` 前后），
+现在四个方向都能看到真正的系统调用。
+
+**同机同传输的干净对比（920B，两者都写 UDS）**：
+
+| | writev 系统调用 |
+|---|---:|
+| kitex-server（Go） | **3.2 µs** |
+| envoy-in 上游（C++） | **3.1 µs** |
+
+**基本一致 —— 7~10 倍彻底不存在。**
+
+Envoy 侧现在三段分开：
+
+| 段 | envoy-out | envoy-in |
+|---|---:|---:|
+| 写socket(仅入队) | 300 ns | 770 ns |
+| 入队 → 真正写出（事件循环调度） | 1.4 µs | 2.6 µs |
+| **★ writev 系统调用** | **3.2 µs** | **3.1 µs** |
+
+「入队 → 真正写出」是 Envoy 异步写模型的固有延迟，Go 的同步 Flush 没有对应物 ——
+**这才是两种模型的真实差别，而不是系统调用快慢。**
+
+### 遗留：下游 writev 采不到
+
+`dn_writev_*` 实测 0 条。下游响应的 `write()` 只入队，真正的 writev 由事件循环
+稍后执行，而那时 `doDeferredRpcDestroy` 已经 `KITEX_PROBE_END` 释放了绑定。
+要采到得改绑定生命周期，有泄漏风险，本轮没做。
+
+## Go 侧写路径拆开
 
 `mesh_socket_write_start/finish` 此前括住整个 `Flush()`，是个黑盒。拆开后：
 

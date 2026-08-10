@@ -86,6 +86,7 @@ readv 系统调用、事件循环调度。现已拆开:
 |---|---|---|
 | `up_epoll_wake` | `connection_impl.cc` `onFileEvent`,取 **`dispatcher.approximateMonotonicTime()`** | **事件后端返回、尚未派发任何回调的那一瞬**。⑤→这里才是真正的等待 |
 | `up_readv_start` / `up_readv_done` | `connection_impl.cc` `transport_socket_->doRead()` 前后 | socket 收包。注意 `doRead` 内部是循环,会反复 readv 直到 EAGAIN,所以是「N 次 readv + N 次 append」的总和 |
+| `up_writev_start` / `up_writev_done` | `connection_impl.cc` `onWriteReady()` 里 `doWrite()` 前后 | **真正的 writev**。`up_socket_write_done` 记的是 `write()` 入队,不是系统调用 —— 这个区别曾让「Go 写 socket 比 Envoy 贵 7–10 倍」的错误结论挂了很久。`onWriteReady` 每条 trace 触发多次,第 1 次才是请求发送,其余是空写;merge 取最早一次 |
 
 > **`up_epoll_wake` 取的是缓存值,不是「现在」——这一点很容易改错,改错了还看不出来。**
 >
