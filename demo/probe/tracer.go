@@ -51,6 +51,8 @@ type Tracer struct {
 	ch     chan *Event
 	wg     sync.WaitGroup
 	closed atomic.Bool
+	// 收尾只做一次，**且后到的调用者会阻塞到第一个跑完**。理由见 Close()。
+	closeOnce sync.Once
 
 	// 统计：用于事后核对「采样了多少、丢了多少」。
 	// 丢弃计数不为零说明 channel 容量或落盘速度不够，
@@ -232,19 +234,28 @@ func (t *Tracer) Stats() (total, sampled, dropped uint64) {
 	return t.total.Load(), t.sampled.Load(), t.dropped.Load()
 }
 
+// Close 刷盘并打印收尾统计。可以被调用多次，后到者阻塞到第一次跑完为止。
+//
+// **不能写成 `if t.closed.Swap(true) { return }` 提前返回**：server 有两条收尾
+// 路径 —— main 里的 defer，和信号 goroutine 里的 `tr.Close(); os.Exit(0)`。
+// 用 Swap 的话谁抢到谁去刷盘+打印，另一个立即返回、紧接着 os.Exit(0)
+// 就把进程干掉了。实测表现为 **trace 数据刷成功了（wg.Wait 已完成）
+// 但汇总行没打出来**，三轮复现一轮 —— 而那行正是 runbook 判定数据完整性的依据，
+// 「行不在」会被误读成「数据不全」。sync.Once.Do 让后到者等前者跑完才返回。
 func (t *Tracer) Close() {
-	if t.closed.Swap(true) {
-		return
-	}
-	close(t.ch)
-	t.wg.Wait()
-	total, sampled, dropped := t.Stats()
-	fmt.Fprintf(os.Stderr, "[probe] node=%s 总请求=%d 采样=%d 丢弃=%d\n",
-		t.node, total, sampled, dropped)
-	if dropped > 0 {
-		fmt.Fprintf(os.Stderr,
-			"[probe] 警告：有 %d 条事件被丢弃，trace 数据不完整，不可用于归因结论\n", dropped)
-	}
+	t.closeOnce.Do(func() {
+		// emit 靠这个标志快速拒收，必须在 close(t.ch) 之前置位。
+		t.closed.Store(true)
+		close(t.ch)
+		t.wg.Wait()
+		total, sampled, dropped := t.Stats()
+		fmt.Fprintf(os.Stderr, "[probe] node=%s 总请求=%d 采样=%d 丢弃=%d\n",
+			t.node, total, sampled, dropped)
+		if dropped > 0 {
+			fmt.Fprintf(os.Stderr,
+				"[probe] 警告：有 %d 条事件被丢弃，trace 数据不完整，不可用于归因结论\n", dropped)
+		}
+	})
 }
 
 func eventAttrs(ev rpcinfo.Event) map[string]string {
