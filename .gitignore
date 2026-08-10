@@ -2,3 +2,12 @@
 *.sock
 /build/
 /out/
+
+# Envoy 按 worker 线程分文件，名字是 trace-xxx.ndjson.<tid> ——
+# 上面那条 *.ndjson **匹配不到**它们（runbook §4.2 ① 同一个坑）。
+*.ndjson.*
+
+# results 目录只入库 merge 的分析输出。全量 CSV 动辄几百 KB，
+# 入库的是 *-table-sample.csv；merge 二进制是本地临时编的，更不该进。
+/docs/results/*/*-table.csv
+/docs/results/*/merge
