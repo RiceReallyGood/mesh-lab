@@ -15,7 +15,7 @@
 | 类别 | 覆盖 | 最大缺口 |
 |---|---|---|
 | 各阶段处理时间 | 🟢 **好** | 中间件/filter 链内部不可分 |
-| socket 接口时间 | 🟡 **接收侧已补齐，发送侧不对称** | **netpoll 的 writev 边界没拆** —— 这正是"Go 侧写 socket 贵 7–10 倍"查不出原因的地方 |
+| socket 接口时间 | 🟡 **Envoy 四个边界已对称（2026-08-10）；Go 侧发送仍不对称** | **netpoll 的 writev 边界没拆** —— 这正是"Go 侧写 socket 贵 7–10 倍"查不出原因的地方 |
 | 排队时间 | 🟡 **本轮从零到部分覆盖** | 内核 accept 队列、TCP 发送缓冲区阻塞、服务端 goroutine 池 |
 | 链路上的时间 | 🔴 **只能得往返，且看不见 socket 以下的一切** | **网卡、驱动、协议栈、softirq 全部不可见** |
 
@@ -108,15 +108,28 @@ LinkBuffer 链表整理 → `outputs()` 拼 iovec → `writev` → 写不完则�
 要拆开需在 netpoll 的 `connection_reactor.go` 的 `outputs`/`outputAck` 与 `sys_exec.go` 的 `writev` 上再加一组点位，
 结构与本轮做的读路径完全对称。**建议下一轮就做**——读路径的框架（`ReadProbe` 槽位、原子快照、`Consistent` 校验）可以直接复用。
 
-### 缺口：Envoy 下游侧
+### ~~缺口：Envoy 下游侧~~ —— 2026-08-10 已补齐
 
-本轮的 3 个点位只挂在**上游**连接上（`onPoolReady` 时设 dn_id）。下游连接的 epoll/readv 仍不可见。
+**这一节原来的结论「做不到」是错的**，留在这里作为记录。
 
-不做的理由是**做不到**而非不想做：下游的读发生在 `bindTrace` **之前**——那时还没解析 TTHeader，不知道 trace 也不知道采样。
-无差别打点在压测下不可接受。
+原文说：下游的读发生在 `bindTrace` **之前**，那时还没解析 TTHeader，不知道 trace
+也不知道采样，无差别打点在压测下不可接受 —— 前半句对，后半句的推论错了。
+「采样未知」逼着放弃的只是**事件队列**这一种存储方式，不是打点本身：
+改用**每连接固定时间戳槽位、覆盖式写入**，未采样请求的代价就是一次哈希查找加一次
+store，零分配，`bindTrace` 时再决定兑现还是丢弃（机制见 `probe-points.md` §一）。
 
-影响有限：下游侧 Envoy 是在等客户端，那属于被测系统之外。真正想看的下游数字是**响应回写**，
-目前只有 `resp_decoded → rpc_done` 一个粗粒度区间。
+而且原文说「影响有限」也低估了：下游读那一段虽然发生在本跳，却被**上一跳的
+「纯等待」**整段吸收 —— 上一跳那段占端到端 79 %，是全链路最大的一坨，
+却因为下界卡在 `dn_first_byte` 而从未被分解过。
+
+现在四个 socket 边界对称了：
+
+| | 接收 | 发送 |
+|---|---|---|
+| Envoy 上游 | `up_readv_start/done` ✓ | `up_encode_done` → `up_socket_write_done` ✓ |
+| Envoy 下游 | `dn_readv_start/done` ✓ | `dn_encode_done` → `dn_socket_write_done` ✓ |
+
+响应回写也从 `resp_decoded → rpc_done` 一个粗粒度区间拆成了「响应编码 / 写 socket」两段。
 
 ---
 

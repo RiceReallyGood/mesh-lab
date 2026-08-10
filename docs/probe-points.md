@@ -5,11 +5,15 @@
 
 ---
 
-## 一、Envoy 侧(骨架 8 个点 + 细分 6 个,每跳实际发射 15 个点位名)
+## 一、Envoy 侧(骨架 8 个点 + 细分 11 个,每跳实际发射 20 个点位名)
 
 请求经过一个 Envoy sidecar 的完整路径:
 
 ```
+ ⓪dn_epoll_wake      下游 epoll 就绪（2026-08-10 新增）
+        │  ← 事件循环排队
+   dn_readv_start / dn_readv_done   下游 socket 收包
+        │  ← buffer 管理 + filter chain 派发
  ①dn_first_byte      下游数据到达
         │  ← TTHeader 解析
  ②hdr_decoded        trace 可知（此刻才知道是否采样）
@@ -23,9 +27,19 @@
  ⑥up_first_byte      上游响应首字节
         │  ← 响应解码
  ⑦resp_decoded       响应解析完成
+        │  ← 下游响应编码（2026-08-10 新增）
+   dn_encode_done
+        │  ← 写下游 socket（2026-08-10 新增）
+   dn_socket_write_done
         │
  ⑧req_done / rpc_done
 ```
+
+> **四个 socket 边界**。每跳 Envoy 横跨两条连接（下游 UDS、上游 TCP），
+> 各有收发。2026-08-10 之前只有上游那条被插桩，下游整条不可见 ——
+> 于是「上一跳的纯等待」里一直混着下一跳 `dn_first_byte` 之前的全部时间。
+> 补齐后四个边界对称：`dn_readv_*` / `up_encode_done`+`up_socket_write_done` /
+> `up_readv_*` / `dn_encode_done`+`dn_socket_write_done`。
 
 | # | 点位 | 代码位置 | 含义 | 去掉它就算不出什么 |
 |---|---|---|---|---|
@@ -109,14 +123,40 @@ readv 系统调用、事件循环调度。现已拆开:
 不用旁路 map 的原因:通用读路径服务全进程所有连接,压测下每个 epoll 事件做一次哈希查找不可接受。
 裸成员让未采样路径退化成一次读加一次分支。
 
-**只挂上游连接**。下游侧做不到——下游的读发生在 `bindTrace` 之前,那时还不知道采样与否。
+**裸标志只挂上游连接**。下游侧的读发生在 `bindTrace` 之前,那时还不知道采样与否,
+所以下游走的是另一套机制 —— 见下。
+
+### 下游读:时间戳槽位(2026-08-10 新增)
+
+下游读的采样状态**在物理上不可知**:traceparent 还在没解析的字节流里。
+既不能像上游那样「查一次采样、挂裸标志」,也不该像 `dn_first_byte` 那样往
+`pending` vector 里塞完整 Event —— 3 个点 × 99% 未采样请求 = 白做的 `push_back`
+与可能的扩容,违反「未采样近乎零开销」。
+
+改用**每连接固定三个 int64 槽位,覆盖式写入**:
+
+```cpp
+struct ConnSlots { int64_t epoll_wake, readv_start, readv_done; };   // probe.cc
+void connSlot(uint64_t conn_id, Slot which, MonotonicTime mono);      // probe.h
+```
+
+- 写:读路径上一次哈希查找 + 一次 store,零分配。**这就是未采样请求付的全部代价。**
+- 取:`bindTrace` 确认采样后才兑现成事件,wall 由基准点推算(不回头读 CLOCK_REALTIME)。
+- 清:`endRpc` 里连同 `bindings`/`pending` 一起 erase,防止 map 无界增长。
+
+与 Kitex 侧 netpoll 探针的「时间戳槽位」是同一个模式。
+
+**side 的判定不改 `envoy/network/connection.h`**:`ClientConnectionImpl : public
+ConnectionImpl` —— 主动发起的连接天然是派生类,被 accept 的不是。构造函数里置
+`kitex_probe_upstream_` 即可。改那个核心接口头会触发 1134 个动作的大范围重编,
+而且多一处 rebase 冲突点;走派生类判定是 26 秒的增量。
 
 ### 已知缺口
 
 | 想测但目前测不了 | 为什么还没做 |
 |---|---|
 | **listener accept** | 属于连接级而非请求级;新建连接的成本已体现在 client 侧的 `client_conn_start/finish` 与上游侧的 `up_conn_new` |
-| **下游侧 epoll/readv** | 见上,采样状态在下游读发生时尚不可知 |
+| **filter chain 内各 filter 耗时** | 本实验只挂 thrift_proxy 一个 filter,测不出东西;真实部署挂十几个 filter 时必须补 |
 
 ---
 
