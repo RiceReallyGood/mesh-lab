@@ -561,20 +561,32 @@ func printBreakdown(traces map[string][]Event) {
 		return
 	}
 
-	fmt.Printf("── 端到端分解（avg，可相加）\n")
+	fmt.Printf("── 端到端分解\n")
+	fmt.Printf("  %s %10s %6s %10s %10s %10s\n",
+		padRight("", 30), "avg", "占比", "p50", "p90", "p99")
 	total := mean(totals)
 	var acc int64
+	sort.Sort(int64Slice(totals))
 	for _, l := range links {
 		if len(l.samples) == 0 {
 			continue
 		}
 		v := mean(l.samples)
 		acc += v
-		fmt.Printf("  %s %10s   %5.1f%%\n", padRight(l.label, 30), dur(v), float64(v)/float64(total)*100)
+		g := append([]int64(nil), l.samples...)
+		sort.Sort(int64Slice(g))
+		fmt.Printf("  %s %10s %5.1f%% %10s %10s %10s\n", padRight(l.label, 30),
+			dur(v), float64(v)/float64(total)*100,
+			dur(pct(g, 0.50)), dur(pct(g, 0.90)), dur(pct(g, 0.99)))
 	}
-	fmt.Printf("  %s %10s   %5s\n", padRight(strings.Repeat("─", 15), 30), strings.Repeat("─", 8), "─────")
-	fmt.Printf("  %s %10s   %5.1f%%\n", padRight("合计", 30), dur(acc), float64(acc)/float64(total)*100)
-	fmt.Printf("  %s %10s\n", padRight("端到端（client 总时长）", 30), dur(total))
+	fmt.Printf("  %s %10s %6s %10s %10s %10s\n", padRight(strings.Repeat("─", 15), 30),
+		strings.Repeat("─", 8), "─────", strings.Repeat("─", 8), strings.Repeat("─", 8), strings.Repeat("─", 8))
+	// 合计行的分位数**故意留空**：Σp50(各段) ≠ p50(总)，填上去只会诱导读者相加。
+	// 下一行给端到端自己的分位数，两行一对照就能看出这件事。
+	fmt.Printf("  %s %10s %5.1f%% %10s %10s %10s\n", padRight("合计（仅 avg 可加）", 30),
+		dur(acc), float64(acc)/float64(total)*100, "—", "—", "—")
+	fmt.Printf("  %s %10s %6s %10s %10s %10s\n", padRight("端到端（client 总时长）", 30),
+		dur(total), "", dur(pct(totals, 0.50)), dur(pct(totals, 0.90)), dur(pct(totals, 0.99)))
 
 	fmt.Printf("\n── 这两个量到底是什么\n")
 	fmt.Printf("\n")
@@ -596,7 +608,9 @@ func printBreakdown(traces map[string][]Event) {
 	fmt.Printf("  （望远镜求和：中间每个「N 总」都被加一次减一次）。\n")
 	fmt.Printf("\n")
 	fmt.Printf("  三条限制：\n")
-	fmt.Printf("  1. **只有 avg 能这么相加，分位数不可加** —— 所以本表只给 avg（§9.3 ①）。\n")
+	fmt.Printf("  1. **只有 avg 列能相加**。p50/p90/p99 描述的是**每一段自己的分布**，\n")
+	fmt.Printf("     可以横向比较（哪一段尾巴长），但**不能纵向相加** —— Σp50(各段) ≠ p50(总)，\n")
+	fmt.Printf("     所以那三列不给百分比，合计行也留空。想验证就对比最后两行。\n")
 	fmt.Printf("  2. **「往返」不可拆分单向**：跨机是物理限制（需 PTP + 硬件时间戳网卡）；\n")
 	fmt.Printf("     同机 UDS 同理 —— 差值法给出的本来就是一个来回。\n")
 	fmt.Printf("  3. **「往返」不是纯线路时间**：B 起算点之前的排队（listener/worker 队列、\n")
@@ -1305,3 +1319,10 @@ func printTable(traces map[string][]Event, ids []string, limit int) {
 		_ = w.Write(rec)
 	}
 }
+
+// int64Slice 让 []int64 可排序。pct() 要求输入已升序。
+type int64Slice []int64
+
+func (x int64Slice) Len() int           { return len(x) }
+func (x int64Slice) Less(i, j int) bool { return x[i] < x[j] }
+func (x int64Slice) Swap(i, j int)      { x[i], x[j] = x[j], x[i] }
