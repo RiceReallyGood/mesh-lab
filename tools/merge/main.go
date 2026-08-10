@@ -56,6 +56,12 @@ func main() {
 	)
 	flag.Parse()
 
+	// 区间定义的自检。放在最前面：宁可起不来，也不要输出被静默合并过的数据。
+	if err := checkPhaseNames(phases()); err != nil {
+		fmt.Fprintln(os.Stderr, "区间定义有误:", err)
+		os.Exit(2)
+	}
+
 	if flag.NArg() == 0 {
 		fmt.Fprintln(os.Stderr, "用法: merge [选项] <trace1.ndjson> [trace2.ndjson ...]")
 		os.Exit(2)
@@ -194,6 +200,127 @@ func groupByNode(events []Event) []*nodeSpan {
 	return spans
 }
 
+// placedEvent 是摆到「本机统一时间轴」上的一个事件。
+type placedEvent struct {
+	Offset int64 // 相对本机原点的偏移
+	Node   string
+	Point  string
+}
+
+// printHostTimelines 按物理机分块，块内所有节点的事件合并成一条时间线。
+//
+// **为什么原点只能取 wall**：同机的两个进程共享 CLOCK_REALTIME，wall 在同机内可比；
+// 而 mono 不可比 —— Go 侧的 monoBase 是**进程相对**的（tracer.go 里
+// `monoBase = time.Now()`），Envoy 侧的 MonotonicTime 是**开机相对**的，
+// 两者根本不是一个基准。
+//
+// **但精度仍由 mono 保证**：只有「节点起始点之间的相对位置」用 wall，
+// 节点内部各点的偏移照旧用 mono 相减。所以相邻两点的时长精度不受任何影响，
+// 只有跨节点的衔接处引入 wall 的读数抖动（同机实测在微秒级）。
+//
+// 跨机不做对齐：两台机器各自一块，中间画分隔。**不做任何形式的跨机原点估算**
+// （例如按「上一跳 up_write_done + 半个往返」去摆对端）—— 那等于把估算值
+// 画成事实，正是 §8.2 要防的操作。
+func printHostTimelines(spans []*nodeSpan) {
+	order := []string{}
+	byHost := map[string][]*nodeSpan{}
+	for _, s := range spans {
+		if _, ok := byHost[s.Host]; !ok {
+			order = append(order, s.Host)
+		}
+		byHost[s.Host] = append(byHost[s.Host], s)
+	}
+
+	// 主机之间**按角色排序，不按时钟** —— 请求发起方那台排前面。
+	//
+	// 不能沿用 spans 的 wall 排序：跨机 wall 差多少全看两台机器的时钟偏斜
+	// （本环境实测 16 秒），排出来的先后与因果无关。实测就出现过
+	// 920B 排在 950 前面 —— 而请求明明发起于 950，这是纯粹的假象。
+	//
+	// 判据取「哪台机器上有 kitex-client」。找不到就维持原顺序，
+	// 并在标题里说明顺序不可靠。
+	clientHost := ""
+	for _, s := range spans {
+		if s.Node == "kitex-client" {
+			clientHost = s.Host
+			break
+		}
+	}
+	if clientHost != "" {
+		reordered := []string{clientHost}
+		for _, h := range order {
+			if h != clientHost {
+				reordered = append(reordered, h)
+			}
+		}
+		order = reordered
+	}
+
+	for hi, host := range order {
+		group := byHost[host]
+
+		// 本机原点 = 该机上最早开始的那个节点的起始 wall
+		originWall := group[0].StartWall
+		for _, s := range group {
+			if s.StartWall < originWall {
+				originWall = s.StartWall
+			}
+		}
+
+		placed := []placedEvent{}
+		for _, s := range group {
+			// 节点起始点相对本机原点的位置（用 wall，同机合法）
+			nodeBase := s.StartWall - originWall
+			for _, ev := range s.Events {
+				// 节点内部偏移用 mono，精度不打折
+				placed = append(placed, placedEvent{
+					Offset: nodeBase + (ev.MonoNs - s.StartMono),
+					Node:   s.Node,
+					Point:  ev.Point,
+				})
+			}
+		}
+		sort.SliceStable(placed, func(i, j int) bool { return placed[i].Offset < placed[j].Offset })
+
+		if hi > 0 {
+			fmt.Println("║")
+			fmt.Println("║  ╌╌╌ 跨机分隔：以下是另一台机器，时间轴独立，与上面不可对齐 ╌╌╌")
+		}
+		nodeNames := make([]string, 0, len(group))
+		for _, s := range group {
+			nodeNames = append(nodeNames, s.Node)
+		}
+		fmt.Printf("║ ┌─ host=%s  节点: %s   原点 = 本机最早事件\n", host, strings.Join(nodeNames, " + "))
+
+		prevNode := ""
+		prevOffset := int64(0)
+		for i, p := range placed {
+			// 换节点时标注与上一行的间隔。
+			//
+			// **措辞刻意保守**：这是「相邻两行之差」，不一定是因果配对。
+			// 例如 client 写完 socket 后还会记 write_finish / read_start /
+			// mesh_socket_read_start 三个点，才轮到 envoy 的第一个点 ——
+			// 此时相邻行之差比真正的 UDS 传递时间小。要因果配对请自己挑两个点相减，
+			// 工具不替你猜哪两个点构成一次传递。
+			mark := ""
+			if i > 0 && p.Node != prevNode {
+				gap := p.Offset - prevOffset
+				if gap < 0 {
+					// 两个进程各自读 wall 的抖动，同机也可能出现小幅倒挂。
+					// 标注出来，不假装它是负延迟。
+					mark = "  ◀ 距上一行 <0（wall 抖动）"
+				} else {
+					mark = fmt.Sprintf("  ◀ 距上一行 %s", dur(gap))
+				}
+			}
+			fmt.Printf("║ │ %9s  %-14s %s%s\n", dur(p.Offset), p.Node, p.Point, mark)
+			prevNode = p.Node
+			prevOffset = p.Offset
+		}
+		fmt.Println("║ └─")
+	}
+}
+
 func printWaterfall(id string, events []Event, skew map[string]int64) {
 	spans := groupByNode(events)
 
@@ -226,14 +353,7 @@ func printWaterfall(id string, events []Event, skew map[string]int64) {
 	}
 	fmt.Println("║")
 
-	for _, s := range spans {
-		fmt.Printf("║ ▸ %-16s [host=%s]  本地区间 %s\n", s.Node, s.Host, dur(s.Duration()))
-		base := s.StartMono
-		for _, ev := range s.Events {
-			// 同节点内相减，安全
-			fmt.Printf("║     %8s  %s\n", dur(ev.MonoNs-base), ev.Point)
-		}
-	}
+	printHostTimelines(spans)
 
 	// 差值法导出跨节点开销（§8.2.3）。
 	// 只用「各自在本机测得的时长」相减，时钟偏斜完全抵消。
@@ -437,6 +557,14 @@ type phase struct {
 func phases() []phase {
 	return []phase{
 		// —— Envoy 每跳的内部阶段 ——
+		// ↓ 下游收包：请求进入本跳的 socket 边界。
+		//   补这三段之前，本跳最早的点是 dn_first_byte，而它已经在 socket 读、
+		//   buffer append、filter chain 派发**之后** —— 于是这一整段被算进了
+		//   **上一跳的「纯等待」**里。上一跳那段占端到端 79%，却因此从未被分解过。
+		{"envoy-out", "⓪ 下游收包(到dn_first_byte)", "dn_epoll_wake", "dn_first_byte"},
+		{"envoy-out", "   ├ ★下游事件循环排队", "dn_epoll_wake", "dn_readv_start"},
+		{"envoy-out", "   ├ 下游readv系统调用", "dn_readv_start", "dn_readv_done"},
+		{"envoy-out", "   └ 下游buffer+filter派发", "dn_readv_done", "dn_first_byte"},
 		{"envoy-out", "①→② TTHeader解析", "dn_first_byte", "hdr_decoded"},
 		{"envoy-out", "②→③ 协议层解头", "hdr_decoded", "msg_begin"},
 		{"envoy-out", "③→④ 路由匹配", "msg_begin", "route_resolved"},
@@ -451,7 +579,15 @@ func phases() []phase {
 		{"envoy-out", "   ├ readv系统调用", "up_readv_start", "up_readv_done"},
 		{"envoy-out", "   └ buffer+filter派发", "up_readv_done", "up_first_byte"},
 		{"envoy-out", "⑥→⑦ 响应解码", "up_first_byte", "resp_decoded"},
+		// ↓ 下游回写：响应离开本跳的 socket 边界。与上游侧的「编码/写socket」对称。
+		{"envoy-out", "⑦→⑧ 下游回写", "resp_decoded", "dn_socket_write_done"},
+		{"envoy-out", "   ├ 响应编码", "resp_decoded", "dn_encode_done"},
+		{"envoy-out", "   └ 写socket(下游)", "dn_encode_done", "dn_socket_write_done"},
 
+		{"envoy-in", "⓪ 下游收包(到dn_first_byte)", "dn_epoll_wake", "dn_first_byte"},
+		{"envoy-in", "   ├ ★下游事件循环排队", "dn_epoll_wake", "dn_readv_start"},
+		{"envoy-in", "   ├ 下游readv系统调用", "dn_readv_start", "dn_readv_done"},
+		{"envoy-in", "   └ 下游buffer+filter派发", "dn_readv_done", "dn_first_byte"},
 		{"envoy-in", "①→② TTHeader解析", "dn_first_byte", "hdr_decoded"},
 		{"envoy-in", "②→③ 协议层解头", "hdr_decoded", "msg_begin"},
 		{"envoy-in", "③→④ 路由匹配", "msg_begin", "route_resolved"},
@@ -464,6 +600,9 @@ func phases() []phase {
 		{"envoy-in", "   ├ readv系统调用", "up_readv_start", "up_readv_done"},
 		{"envoy-in", "   └ buffer+filter派发", "up_readv_done", "up_first_byte"},
 		{"envoy-in", "⑥→⑦ 响应解码", "up_first_byte", "resp_decoded"},
+		{"envoy-in", "⑦→⑧ 下游回写", "resp_decoded", "dn_socket_write_done"},
+		{"envoy-in", "   ├ 响应编码", "resp_decoded", "dn_encode_done"},
+		{"envoy-in", "   └ 写socket(下游)", "dn_encode_done", "dn_socket_write_done"},
 
 		// —— Kitex client ——
 		{"kitex-client", "取连接", "client_conn_start", "client_conn_finish"},
@@ -496,6 +635,26 @@ func phases() []phase {
 		{"kitex-server", "编码(发送前)", "write_start", "mesh_socket_write_start"},
 		{"kitex-server", "  写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
 	}
+}
+
+// checkPhaseNames 保证同一节点下不出现重名区间。
+//
+// detail / table 都用 `node|name` 当聚合键，重名不会报错，而是**静默把两个
+// 不同区间的样本合进同一个桶** —— 输出看起来完全正常，只有 n= 翻倍这一个
+// 微弱线索。补下游点位时就踩了一次：新加的「buffer+filter派发」与上游同名，
+// 两处显示成一模一样的数值、n=2000。
+//
+// 与其指望下次还能看出 n= 不对，不如让它直接起不来。
+func checkPhaseNames(ph []phase) error {
+	seen := map[string]bool{}
+	for _, p := range ph {
+		key := p.node + "|" + p.name
+		if seen[key] {
+			return fmt.Errorf("区间重名: %s —— 同名会被静默合并成一个桶，必须改名", key)
+		}
+		seen[key] = true
+	}
+	return nil
 }
 
 func printDetail(traces map[string][]Event) {
@@ -611,11 +770,17 @@ func durOf(v []int64, q float64) string {
 //
 // **两重不确定性，用之前必须知道。**
 //
-// 其一，它不是纯线路时间。内层节点的「总时长」从 dn_first_byte（数据到达该节点）
-// 起算，而请求在此之前还可能在 listener 队列、worker 队列里等过 —— 那段落在
-// 内层的测量区间之外，于是全被这个差值吸收进来。实测把 Envoy worker 从 384 压到 2，
-// 同机 UDS 的「单程」从 21µs 涨到 128µs：多出来的一百微秒是排队，不是传输。
-// 想看纯传输，只能在低负载、无排队时读这一列。
+// 其一，它不是纯线路时间。内层节点的「总时长」有一个起算点，早于它的一切
+// 都落在内层的测量区间之外，于是全被这个差值吸收进来。实测把 Envoy worker
+// 从 384 压到 2，同机 UDS 的「单程」从 21µs 涨到 128µs：多出来的一百微秒
+// 是排队，不是传输。想看纯传输，只能在低负载、无排队时读这一列。
+//
+// **2026-08-10 起这个起算点前移了**：Envoy 节点从 dn_first_byte 改成
+// dn_epoll_wake（补了下游读点位），于是「下游 epoll 唤醒 → readv → filter 派发」
+// 这一段不再被吸收，改由内层自己认领。剩下仍被吸收的是 listener/worker 队列
+// 里的等待 —— 即 epoll 就绪**之前**的部分。
+// **跨版本比较 net.* 列时要注意这个口径变化**：新口径的值会比旧口径小一些
+// （实测跨机双跳小 4.2µs），不是网络变快了。
 //
 // 其二，差值法只能得到往返：
 //
@@ -754,8 +919,9 @@ func printTable(traces map[string][]Event, ids []string, limit int) {
 
 	fmt.Printf("# 单位: 微秒(µs)。样本 %d 条 trace。\n", len(traces))
 	fmt.Printf("# 前四行为全量样本的聚合值，与 -limit 无关。\n")
-	fmt.Printf("# net.* = (外层等待 − 内层总时长) / 2。**不是纯线路时间**：内层总时长从 dn_first_byte 起算，\n")
-	fmt.Printf("#   此前在 listener/worker 队列里的等待落在测量区间之外，于是被算进了这一列。\n")
+	fmt.Printf("# net.* = (外层等待 − 内层总时长) / 2。**不是纯线路时间**：内层总时长从该节点最早的点起算\n")
+	fmt.Printf("#   （Envoy 侧 2026-08-10 起是 dn_epoll_wake，此前是 dn_first_byte），\n")
+	fmt.Printf("#   更早的 listener/worker 队列等待落在测量区间之外，于是被算进了这一列。\n")
 	fmt.Printf("#   高负载下它以排队为主 —— 实测把 Envoy worker 从 384 压到 2，UDS 单程从 21µs 涨到 128µs。\n")
 	fmt.Printf("#   除以 2 还隐含「去程回程对称」的假设。单条为负属正常，见源码注释。\n")
 	fmt.Printf("# 注意分位数不可加：各列 p50 之和 ≠ 总时长 p50。\n")
