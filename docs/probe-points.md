@@ -170,7 +170,7 @@ ConnectionImpl` —— 主动发起的连接天然是派生类,被 accept 的不
 | `client_conn_start` / `client_conn_finish` | `remotecli/conn_wrapper.go:121,139` | 从连接池取连接 | **建连成本**。实测冷启动可达 2.3 ms,是首请求延迟的主因 |
 | `write_start` / `write_finish` | `default_client_handler.go:49,52`<br>`default_server_handler.go:67,70` | 编码并写入 socket | **发送耗时**(含编码) |
 | `read_start` / `read_finish` | 同上 `:67,70` / `:98,100` | 读取并解码 | **接收耗时** |
-| `wait_read_start` / `wait_read_finish` | `codec/thrift/thrift.go:211,220` | 等待 payload 到齐 | **★ 实际等待对端的时间**;`read_start→wait_read_start` 是读 header,`wait_read` 区间才是等 body |
+| `wait_read_start` / `wait_read_finish` | `codec/thrift/thrift.go:211,220` | 等待 body 剩余字节到齐 | 见下面「两个『等待』的关系」 |
 | `server_handle_start` / `server_handle_finish` | `server/server.go:373,368` | 业务 handler 执行 | **业务逻辑耗时**。echo 场景实测仅 **220~240 ns**(三种拓扑下逐项一致),便于把框架开销与业务开销分开 |
 
 ### 补充的自定义点(已实现,`kitex/pkg/stats/meshlab_events.go`)
@@ -185,7 +185,42 @@ ConnectionImpl` —— 主动发起的连接天然是派生类,被 accept 的不
 | **`mesh_socket_write_start/finish`** | `bufWriter.Flush()` 前后 | `WriteStart/Finish` 括住"编码+写"整段,**分不清是序列化慢还是 socket 慢**。Flush 才是真正触发 write 系统调用的地方 |
 | `mesh_hdr_decode_start/finish` | `ttHeaderCodec.decode` 前后 | TTHeader 解析耗时 |
 | `mesh_hdr_encode_start/finish` | Encode 的 header 段 | TTHeader 编码耗时;mesh 场景的核心成本项 |
-| `mesh_payload_codec_start/finish` | `encodePayload` 前后 | thrift 序列化耗时 |
+| `mesh_payload_codec_start/finish` | `encodePayload` 前后 | thrift **序列化**耗时。**只在发送路径上** —— 见下面「payload 只有编码没有解码」 |
+
+### 两个「等待」的关系:先后,不是包含
+
+`★等待对端(纯网络)` 与 `★等待响应体` 容易被当成同一件事,实际是**前后两段**。
+1000 条 trace 相对 `rpc_start` 的中位偏移(client 侧):
+
+```
+  5.91µs  mesh_socket_read_start   ┐
+213.69µs  mesh_np_epoll_wake       │ ★等待对端 = 213µs,大头全在这
+219.08µs  mesh_first_byte          ┘
+219.16µs  mesh_hdr_decode_start
+219.91µs  mesh_hdr_decode_finish
+220.41µs  wait_read_start          ┐ ★等待响应体 = 430ns
+220.85µs  wait_read_finish         ┘
+222.18µs  read_finish
+```
+
+**主要等待在 `mesh_first_byte` 就结束了。** `wait_read` 等的是 header 解完之后
+body 的剩余字节 —— 小报文通常在同一次 readv 里就到齐了,所以只有几百纳秒。
+
+两者都被 `read_start → read_finish`(「读取+解码(整段)」)**包含**,
+后者还额外包含 TTHeader 解码。merge 的 detail 用缩进表达这层嵌套。
+
+### payload 只有编码,没有解码
+
+`mesh_payload_codec_*` 插在 `encodePayload` 前后,**只覆盖发送路径**:
+
+- client 侧实测落在 3.17µs —— 在 `mesh_socket_write_start`(3.59µs) **之前**,是编请求
+- server 侧实测落在 11.13µs —— 在 `server_handle_finish`(9.50µs) **之后**,是编响应
+
+**接收方向的 thrift 反序列化目前没有点位,测不到**,它被折叠在
+`read_start → read_finish` 里。要补的话得在 `decodePayload` 前后再加一对。
+
+> merge 的 detail 曾把这一段标成「payload解码」,是错的,2026-08-10 已改为「payload编码」。
+> 早期报告里出现「payload解码」字样的,指的都是编码。
 
 ---
 

@@ -114,7 +114,7 @@ func main() {
 		}
 		fmt.Printf("\n共 %d 条 trace，已显示 %d 条\n", len(ids), n)
 	case "summary":
-		printSummary(traces)
+		printBreakdown(traces)
 	case "detail":
 		printDetail(traces)
 	case "table":
@@ -384,7 +384,190 @@ func printWaterfall(id string, events []Event, skew map[string]int64) {
 	fmt.Println("╚══")
 }
 
-func printSummary(traces map[string][]Event) {
+// dispWidth 返回字符串在等宽终端里占的列数。
+//
+// Go 的 %-30s 按**字节**补齐，而 CJK 字符是 3 字节却只占 2 列 ——
+// 中英混排的标签用 %-Ns 必然对不齐，列越多歪得越厉害。
+func dispWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		switch {
+		case r >= 0x1100 && (r <= 0x115F || // 韩文字母
+			r == 0x2329 || r == 0x232A ||
+			(r >= 0x2E80 && r <= 0xA4CF && r != 0x303F) || // CJK 及部首
+			(r >= 0xAC00 && r <= 0xD7A3) || // 韩文音节
+			(r >= 0xF900 && r <= 0xFAFF) || // CJK 兼容
+			(r >= 0xFE30 && r <= 0xFE6F) || // CJK 标点
+			(r >= 0xFF00 && r <= 0xFF60) || // 全角
+			(r >= 0xFFE0 && r <= 0xFFE6) ||
+			(r >= 0x20000 && r <= 0x3FFFD)):
+			w += 2
+		default:
+			w++
+		}
+	}
+	return w
+}
+
+// padRight 按显示宽度右填充。宽度不够时不截断 —— 宁可这一行歪，也别把标签切掉。
+func padRight(s string, width int) string {
+	if d := width - dispWidth(s); d > 0 {
+		return s + strings.Repeat(" ", d)
+	}
+	return s
+}
+
+// chainLink 描述端到端分解里的一段：要么是某个节点自身的处理，
+// 要么是相邻两节点之间的一次往返传输。
+type chainLink struct {
+	label   string
+	samples []int64
+}
+
+// waitOf 返回某节点「在等下一跳」的那段时间。
+//
+// 端到端分解的全部依据就是这一个量：**节点总时长 − 它等下一跳的时间 = 节点自身处理**，
+// 而**它等下一跳的时间 − 下一跳的总时长 = 两者之间的往返传输**。
+// 两式交替套用，从 client 一路推到 server，各段相加恰好等于端到端（望远镜求和）。
+//
+// Envoy 侧取「纯等待」（up_write_done → up_epoll_wake）而不是 ⑤→⑥：
+// epoll 就绪之后的 readv、buffer、filter 派发是本跳自己的 CPU 时间，
+// 算进「传输」会高估链路。
+func waitOf(s *nodeSpan) (int64, bool) {
+	at := map[string]int64{}
+	for _, ev := range s.Events {
+		if _, ok := at[ev.Point]; !ok {
+			at[ev.Point] = ev.MonoNs
+		}
+	}
+	var a, b string
+	switch s.Node {
+	case "kitex-client", "kitex-server":
+		a, b = "mesh_socket_read_start", "mesh_first_byte"
+	default: // Envoy 各跳
+		a, b = "up_write_done", "up_epoll_wake"
+	}
+	x, oka := at[a]
+	y, okb := at[b]
+	if !oka || !okb || y < x {
+		return 0, false
+	}
+	return y - x, true
+}
+
+// chainOrder 是请求流经的顺序。分解必须按这个顺序套用差值，
+// 不能按 map 遍历或字典序。
+var chainOrder = []string{"kitex-client", "envoy-out", "envoy-in", "kitex-server"}
+
+// printBreakdown 输出端到端分解：各节点自身处理 + 各段往返传输，**相加等于端到端**。
+//
+// 这是对旧 summary 的替代。旧表给的是各节点的观测区间，而那些区间是**嵌套**的
+// （client 套着 envoy-out，套着 envoy-in，套着 server），既不能相加也算不出占比，
+// 只能看量级。分解表是一个划分，能加到 100%。
+func printBreakdown(traces map[string][]Event) {
+	links := []*chainLink{}
+	idx := map[string]*chainLink{}
+	get := func(label string) *chainLink {
+		if l, ok := idx[label]; ok {
+			return l
+		}
+		l := &chainLink{label: label}
+		idx[label] = l
+		links = append(links, l)
+		return l
+	}
+	totals := []int64{}
+
+	for _, events := range traces {
+		spans := groupByNode(events)
+		byNode := map[string]*nodeSpan{}
+		for _, s := range spans {
+			byNode[s.Node] = s
+		}
+		// 链条上任一节点缺失就跳过这条 trace —— 分解是环环相扣的，
+		// 缺一环后面全部对不上，不如整条不算。
+		chain := []*nodeSpan{}
+		ok := true
+		for _, n := range chainOrder {
+			s, has := byNode[n]
+			if !has {
+				ok = false
+				break
+			}
+			chain = append(chain, s)
+		}
+		if !ok {
+			continue
+		}
+
+		type row struct {
+			label string
+			v     int64
+		}
+		rows := []row{}
+		good := true
+		for i, s := range chain {
+			if i == len(chain)-1 {
+				// 最后一跳（server）不等任何人，总时长就是它自己的处理
+				rows = append(rows, row{s.Node + " 自身", s.Duration()})
+				break
+			}
+			w, has := waitOf(s)
+			if !has {
+				good = false
+				break
+			}
+			next := chain[i+1]
+			rows = append(rows, row{s.Node + " 自身", s.Duration() - w})
+			kind := "UDS"
+			if s.Host != next.Host {
+				kind = "跨机"
+			}
+			rows = append(rows, row{fmt.Sprintf("%s往返 %s↔%s", kind, s.Node, next.Node), w - next.Duration()})
+		}
+		if !good {
+			continue
+		}
+		for _, r := range rows {
+			get(r.label).samples = append(get(r.label).samples, r.v)
+		}
+		totals = append(totals, chain[0].Duration())
+	}
+
+	fmt.Printf("样本数: %d 条 trace\n\n", len(traces))
+	if len(totals) == 0 {
+		fmt.Printf("链条不完整（需要 %v 四个节点齐全），无法做端到端分解\n\n", chainOrder)
+		printNodeSpans(traces)
+		return
+	}
+
+	fmt.Printf("── 端到端分解（avg，可相加）\n")
+	total := mean(totals)
+	var acc int64
+	for _, l := range links {
+		if len(l.samples) == 0 {
+			continue
+		}
+		v := mean(l.samples)
+		acc += v
+		fmt.Printf("  %s %10s   %5.1f%%\n", padRight(l.label, 30), dur(v), float64(v)/float64(total)*100)
+	}
+	fmt.Printf("  %s %10s   %5s\n", padRight(strings.Repeat("─", 15), 30), strings.Repeat("─", 8), "─────")
+	fmt.Printf("  %s %10s   %5.1f%%\n", padRight("合计", 30), dur(acc), float64(acc)/float64(total)*100)
+	fmt.Printf("  %s %10s\n", padRight("端到端（client 总时长）", 30), dur(total))
+
+	fmt.Printf("\n  **只有 avg 能这么相加，分位数不可加** —— 所以本表只给 avg（§9.3 ①）。\n")
+	fmt.Printf("  「往返」不可拆分单向：跨机是物理限制（需 PTP + 硬件时间戳），\n")
+	fmt.Printf("  同机 UDS 同理 —— 差值法只能得到往返。\n")
+	fmt.Printf("  「往返」也**不是纯线路时间**：内层节点起算点之前的排队（listener/worker 队列）\n")
+	fmt.Printf("  落在测量区间之外，全被算进这一列。低负载无排队时才近似真实传输。\n\n")
+
+	printNodeSpans(traces)
+}
+
+// printNodeSpans 是旧 summary 的内容：各节点的观测区间。
+// 保留它是因为这些数是差值法的原始输入，也是既有报告里引用的口径。
+func printNodeSpans(traces map[string][]Event) {
 	type stat struct{ gaps []int64 }
 	agg := map[string]*stat{}
 	crossHost := false
@@ -424,7 +607,7 @@ func printSummary(traces map[string][]Event) {
 	}
 	sort.Strings(names)
 
-	fmt.Printf("样本数: %d 条 trace\n\n", len(traces))
+	fmt.Printf("── 各节点观测区间（**嵌套，不可相加**，差值法的原始输入）\n")
 	fmt.Printf("%-20s %10s %10s %10s %10s %10s\n", "区间", "avg", "p50", "p90", "p99", "max")
 	for _, n := range names {
 		g := agg[n].gaps
@@ -554,86 +737,108 @@ type phase struct {
 }
 
 // 各节点内部的阶段划分。含义见 docs/probe-points.md。
+//
+// **顺序即请求流向**：client → envoy-out → envoy-in → server。
+// detail 就是按这个顺序分节输出的，读者从上往下读就是一次请求的完整旅程。
+// 原来是 envoy 两跳在前、kitex 两端在后，读者得自己在脑子里重排。
 func phases() []phase {
+	ph := []phase{}
+	ph = append(ph, kitexClientPhases()...)
+	ph = append(ph, envoyPhases("envoy-out")...)
+	ph = append(ph, envoyPhases("envoy-in")...)
+	ph = append(ph, kitexServerPhases()...)
+	return ph
+}
+
+// envoyPhases 给出一跳 Envoy 的阶段划分。两跳的划分完全相同，只有节点名不同 ——
+// 以前是照抄两份，改一处漏一处只是时间问题。
+func envoyPhases(node string) []phase {
 	return []phase{
-		// —— Envoy 每跳的内部阶段 ——
 		// ↓ 下游收包：请求进入本跳的 socket 边界。
 		//   补这三段之前，本跳最早的点是 dn_first_byte，而它已经在 socket 读、
 		//   buffer append、filter chain 派发**之后** —— 于是这一整段被算进了
 		//   **上一跳的「纯等待」**里。上一跳那段占端到端 79%，却因此从未被分解过。
-		{"envoy-out", "⓪ 下游收包(到dn_first_byte)", "dn_epoll_wake", "dn_first_byte"},
-		{"envoy-out", "   ├ ★下游事件循环排队", "dn_epoll_wake", "dn_readv_start"},
-		{"envoy-out", "   ├ 下游readv系统调用", "dn_readv_start", "dn_readv_done"},
-		{"envoy-out", "   └ 下游buffer+filter派发", "dn_readv_done", "dn_first_byte"},
-		{"envoy-out", "①→② TTHeader解析", "dn_first_byte", "hdr_decoded"},
-		{"envoy-out", "②→③ 协议层解头", "hdr_decoded", "msg_begin"},
-		{"envoy-out", "③→④ 路由匹配", "msg_begin", "route_resolved"},
-		{"envoy-out", "④→ 取上游连接", "route_resolved", "up_conn_reused"},
-		{"envoy-out", "  编码", "up_conn_reused", "up_encode_done"},
-		{"envoy-out", "  写socket", "up_encode_done", "up_socket_write_done"},
-		{"envoy-out", "⑤→⑥ ★等待上游", "up_write_done", "up_first_byte"},
+		{node, "⓪ 下游收包(到dn_first_byte)", "dn_epoll_wake", "dn_first_byte"},
+		{node, "   ├ ★下游事件循环排队", "dn_epoll_wake", "dn_readv_start"},
+		{node, "   ├ 下游readv系统调用", "dn_readv_start", "dn_readv_done"},
+		{node, "   └ 下游buffer+filter派发", "dn_readv_done", "dn_first_byte"},
+		{node, "①→② TTHeader解析", "dn_first_byte", "hdr_decoded"},
+		{node, "②→③ 协议层解头", "hdr_decoded", "msg_begin"},
+		{node, "③→④ 路由匹配", "msg_begin", "route_resolved"},
+		{node, "④→ 取上游连接", "route_resolved", "up_conn_reused"},
+		{node, "  编码", "up_conn_reused", "up_encode_done"},
+		{node, "  写socket", "up_encode_done", "up_socket_write_done"},
+		{node, "⑤→⑥ ★等待上游", "up_write_done", "up_first_byte"},
 		// ↓ 把上面那段「等待上游」拆开。⑤→epoll唤醒 才是真正在等，
 		//   其余三段是本进程自己的开销，此前全被算作等待。
-		{"envoy-out", "   ├ 纯等待(到epoll就绪)", "up_write_done", "up_epoll_wake"},
-		{"envoy-out", "   ├ ★事件循环排队", "up_epoll_wake", "up_readv_start"},
-		{"envoy-out", "   ├ readv系统调用", "up_readv_start", "up_readv_done"},
-		{"envoy-out", "   └ buffer+filter派发", "up_readv_done", "up_first_byte"},
-		{"envoy-out", "⑥→⑦ 响应解码", "up_first_byte", "resp_decoded"},
+		{node, "   ├ 纯等待(到epoll就绪)", "up_write_done", "up_epoll_wake"},
+		{node, "   ├ ★事件循环排队", "up_epoll_wake", "up_readv_start"},
+		{node, "   ├ readv系统调用", "up_readv_start", "up_readv_done"},
+		{node, "   └ buffer+filter派发", "up_readv_done", "up_first_byte"},
+		{node, "⑥→⑦ 响应解码", "up_first_byte", "resp_decoded"},
 		// ↓ 下游回写：响应离开本跳的 socket 边界。与上游侧的「编码/写socket」对称。
-		{"envoy-out", "⑦→⑧ 下游回写", "resp_decoded", "dn_socket_write_done"},
-		{"envoy-out", "   ├ 响应编码", "resp_decoded", "dn_encode_done"},
-		{"envoy-out", "   └ 写socket(下游)", "dn_encode_done", "dn_socket_write_done"},
+		{node, "⑦→⑧ 下游回写", "resp_decoded", "dn_socket_write_done"},
+		{node, "   ├ 响应编码", "resp_decoded", "dn_encode_done"},
+		{node, "   └ 写socket(下游)", "dn_encode_done", "dn_socket_write_done"},
+	}
+}
 
-		{"envoy-in", "⓪ 下游收包(到dn_first_byte)", "dn_epoll_wake", "dn_first_byte"},
-		{"envoy-in", "   ├ ★下游事件循环排队", "dn_epoll_wake", "dn_readv_start"},
-		{"envoy-in", "   ├ 下游readv系统调用", "dn_readv_start", "dn_readv_done"},
-		{"envoy-in", "   └ 下游buffer+filter派发", "dn_readv_done", "dn_first_byte"},
-		{"envoy-in", "①→② TTHeader解析", "dn_first_byte", "hdr_decoded"},
-		{"envoy-in", "②→③ 协议层解头", "hdr_decoded", "msg_begin"},
-		{"envoy-in", "③→④ 路由匹配", "msg_begin", "route_resolved"},
-		{"envoy-in", "④→ 取上游连接", "route_resolved", "up_conn_reused"},
-		{"envoy-in", "  编码", "up_conn_reused", "up_encode_done"},
-		{"envoy-in", "  写socket", "up_encode_done", "up_socket_write_done"},
-		{"envoy-in", "⑤→⑥ ★等待上游", "up_write_done", "up_first_byte"},
-		{"envoy-in", "   ├ 纯等待(到epoll就绪)", "up_write_done", "up_epoll_wake"},
-		{"envoy-in", "   ├ ★事件循环排队", "up_epoll_wake", "up_readv_start"},
-		{"envoy-in", "   ├ readv系统调用", "up_readv_start", "up_readv_done"},
-		{"envoy-in", "   └ buffer+filter派发", "up_readv_done", "up_first_byte"},
-		{"envoy-in", "⑥→⑦ 响应解码", "up_first_byte", "resp_decoded"},
-		{"envoy-in", "⑦→⑧ 下游回写", "resp_decoded", "dn_socket_write_done"},
-		{"envoy-in", "   ├ 响应编码", "resp_decoded", "dn_encode_done"},
-		{"envoy-in", "   └ 写socket(下游)", "dn_encode_done", "dn_socket_write_done"},
-
-		// —— Kitex client ——
+// kitexPhases 是 Kitex 两侧的阶段划分。client 与 server 用**同一套骨架**：
+//
+//	（唤醒 →）编码/读取 → 等待 → 解码 → handler → 编码 → 发送
+//
+// 两条纪律，都是被实测打脸后才立的：
+//
+//  1. **按真实时序排，不按写代码时想到的顺序。** 原来是声明顺序，于是 server 那栏
+//     出现「payload解码」排在「业务handler」前面、「读取+解码(整段)」排在
+//     「等待请求体」前面 —— 读者会以为那就是执行顺序。1000 条 trace 的中位偏移
+//     排序见 docs/probe-points.md。
+//
+//  2. **父区间与子区间用缩进表达。** 「读取+解码(整段)」是 read_start→read_finish，
+//     它**包含**等待对端、TTHeader 解码、等待响应体三段；平铺在一起会被误读成并列。
+//
+// 关于 mesh_payload_codec_*：它插在 encodePayload 前后，**只在发送路径上**，
+// 所以两侧都叫「payload编码」。曾经标成「payload解码」是错的 ——
+// client 侧实测落在 3.17µs（写 socket 之前），server 侧落在 11.13µs（handler 之后），
+// 都在发送路径。**响应/请求的 payload 解码目前没有点位，测不到。**
+func kitexClientPhases() []phase {
+	return []phase{
 		{"kitex-client", "取连接", "client_conn_start", "client_conn_finish"},
 		{"kitex-client", "编码(发送前)", "write_start", "mesh_socket_write_start"},
-		{"kitex-client", "  写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
-		{"kitex-client", "★等待响应体", "wait_read_start", "wait_read_finish"},
-		{"kitex-client", "★等待对端(纯网络)", "mesh_socket_read_start", "mesh_first_byte"},
+		{"kitex-client", "   ├ TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
+		{"kitex-client", "   └ payload编码", "mesh_payload_codec_start", "mesh_payload_codec_finish"},
+		{"kitex-client", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
+		{"kitex-client", "读取+解码(整段)", "read_start", "read_finish"},
+		{"kitex-client", "   ├ ★等待对端(纯网络)", "mesh_socket_read_start", "mesh_first_byte"},
 		// ↓ netpoll 内部拆解。只在客户端可用（采样判定必须早于阻塞读，
 		//   服务端此刻还读不到 TTHeader 里的 traceparent，见 probe-points.md §2.5）。
 		//   横跨多轮读的快照在 netpoll 侧已被 Consistent 校验剔除，不会出现在这里。
-		{"kitex-client", "   ├ 纯等待(到epoll就绪)", "mesh_socket_read_start", "mesh_np_epoll_wake"},
-		{"kitex-client", "   ├ ★poller事件排队", "mesh_np_epoll_wake", "mesh_np_dispatch"},
-		{"kitex-client", "   ├ readv系统调用", "mesh_np_readv_start", "mesh_np_readv_done"},
-		{"kitex-client", "   ├ LinkBuffer入队", "mesh_np_readv_done", "mesh_np_trigger"},
-		{"kitex-client", "   └ ★goroutine调度延迟", "mesh_np_trigger", "mesh_first_byte"},
-		{"kitex-client", "TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
-		{"kitex-client", "payload解码", "mesh_payload_codec_start", "mesh_payload_codec_finish"},
-		{"kitex-client", "TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
-		{"kitex-client", "读取+解码(整段)", "read_start", "read_finish"},
+		{"kitex-client", "   │  ├ 纯等待(到epoll就绪)", "mesh_socket_read_start", "mesh_np_epoll_wake"},
+		{"kitex-client", "   │  ├ ★poller事件排队", "mesh_np_epoll_wake", "mesh_np_dispatch"},
+		{"kitex-client", "   │  ├ readv系统调用", "mesh_np_readv_start", "mesh_np_readv_done"},
+		{"kitex-client", "   │  ├ LinkBuffer入队", "mesh_np_readv_done", "mesh_np_trigger"},
+		{"kitex-client", "   │  └ ★goroutine调度延迟", "mesh_np_trigger", "mesh_first_byte"},
+		{"kitex-client", "   ├ TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
+		// ↓ 与「等待对端」是**先后关系不是包含关系**：等待对端到 mesh_first_byte 就结束了，
+		//   这一段等的是 header 之后 body 的剩余字节，实测仅几百纳秒。
+		{"kitex-client", "   └ ★等待响应体", "wait_read_start", "wait_read_finish"},
 
-		// —— Kitex server ——
+	}
+}
+
+// kitexServerPhases 与 client 共用上面那套骨架，见 kitexClientPhases 的注释。
+func kitexServerPhases() []phase {
+	return []phase{
 		{"kitex-server", "epoll唤醒→开始读", "mesh_netpoll_onread", "mesh_socket_read_start"},
-		{"kitex-server", "★等待对端(纯网络)", "mesh_socket_read_start", "mesh_first_byte"},
-		{"kitex-server", "TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
-		{"kitex-server", "payload解码", "mesh_payload_codec_start", "mesh_payload_codec_finish"},
-		{"kitex-server", "TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
 		{"kitex-server", "读取+解码(整段)", "read_start", "read_finish"},
-		{"kitex-server", "★等待请求体", "wait_read_start", "wait_read_finish"},
+		{"kitex-server", "   ├ ★等待对端(纯网络)", "mesh_socket_read_start", "mesh_first_byte"},
+		{"kitex-server", "   ├ TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
+		{"kitex-server", "   └ ★等待请求体", "wait_read_start", "wait_read_finish"},
 		{"kitex-server", "业务handler", "server_handle_start", "server_handle_finish"},
 		{"kitex-server", "编码(发送前)", "write_start", "mesh_socket_write_start"},
-		{"kitex-server", "  写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
+		{"kitex-server", "   ├ TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
+		{"kitex-server", "   └ payload编码", "mesh_payload_codec_start", "mesh_payload_codec_finish"},
+		{"kitex-server", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
 	}
 }
 
