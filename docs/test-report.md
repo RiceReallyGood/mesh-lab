@@ -667,7 +667,7 @@ export ENVOY_CONCURRENCY=4          # 三级必须同值，否则线程规模差
 for r in 1 2 3; do
   for topo in direct single two; do
     TOPO=$topo ./scripts/run-cross-machine.sh stop >/dev/null 2>&1; sleep 2
-    rm -rf /tmp/kitex-demo; mkdir -p /tmp/kitex-demo
+    rm -rf "$RUN"; mkdir -p "$RUN"      # RUN=/tmp/kitex-demo-$(id -un)，见 runbook-reproduce §8.2 ④
     TOPO=$topo ./scripts/run-cross-machine.sh start >/dev/null 2>&1
     TOPO=$topo ./scripts/run-cross-machine.sh status >/dev/null || continue
     tgt=$(TOPO=$topo ./scripts/run-cross-machine.sh target)
@@ -676,7 +676,7 @@ for r in 1 2 3; do
     # 顺序不能换：stop（线程退出才刷盘）→ collect（拉回对端数据）
     TOPO=$topo ./scripts/run-cross-machine.sh stop >/dev/null 2>&1; sleep 5
     TOPO=$topo ./scripts/run-cross-machine.sh collect >/dev/null 2>&1
-    mkdir -p ~/ladder/$topo-lo/r$r && mv /tmp/kitex-demo/trace-* ~/ladder/$topo-lo/r$r/
+    mkdir -p ~/ladder/$topo-lo/r$r && mv "$RUN"/trace-* ~/ladder/$topo-lo/r$r/
   done
 done
 # c=16 那组把 -c 1 -sample 0.05 换成 -c 16 -sample 0.01，其余不变

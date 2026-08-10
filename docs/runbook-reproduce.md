@@ -56,7 +56,7 @@
 | `~/.cache/bazel` | **3.0 GB** | 依赖仓库缓存，按 sha256 索引，与 output_base 独立 |
 | `~/sdk` + `~/go` + `~/bin` + `~/dl` | 669 MB | Go 工具链 + module 缓存 + bazel 二进制 |
 | `~/envoy_kitex` | 299 MB | 五个仓库源码（`--depth 1`） |
-| `/tmp/kitex-demo` | **1.2 GB / 轮** | trace 数据，见 §8.2 ③ |
+| `/tmp/kitex-demo-$(id -un)` | **1.2 GB / 轮** | trace 数据，见 §8.2 ③。**按用户隔离**，别用写死的 `/tmp/kitex-demo` |
 | 合计 | **约 70 GB** | |
 
 **准备 80 GB 以上的空闲空间。** 而且必须是 ext4/xfs 这类真实文件系统，不能是 tmpfs（§6.1.3）。
@@ -173,7 +173,7 @@ A 只管连本机的 sidecar，剩下的事 sidecar 干。**这就是「两跳�
 如果你的两台机器 glibc 差得更多，把构建机换成版本更低的那台。
 
 **② `/tmp` 是 tmpfs，两台都是。** 这直接决定了 §6.1.3 的 `--output_base` 不能放 `/tmp`。
-trace 数据放 `/tmp/kitex-demo` 是可以的（写完就拉走），但注意它**占内存**。
+trace 数据放 `/tmp/kitex-demo-$(id -un)` 是可以的（写完就拉走），但注意它**占内存**。
 
 **③ 920B 没有 `jq`。** 本项目的脚本没用到，但你要在 920B 上自己写分析脚本时会踩。
 
@@ -203,8 +203,8 @@ grep -rn "suzhou\|192\.168\.25\." ~/envoy_kitex/mesh-lab/{scripts,envoy-conf}
 |---|---|
 | 15000 / 15001 / 15002 / 15003 | 各份配置的 Envoy admin 接口（同机双跳 out=15001、in=15002；跨机单跳 out=15003） |
 | **15006** | **唯一需要跨机放行的端口。** 双跳时是 envoy-in 在听，直连/单跳时是 kitex-server 在听 |
-| `/tmp/kitex-demo/out.sock` | client → envoy-out 的 UDS |
-| `/tmp/kitex-demo/app.sock` | envoy-in → server 的 UDS（仅双跳） |
+| `$RUN/out.sock` | client → envoy-out 的 UDS（`$RUN` = `/tmp/kitex-demo-$(id -un)`）|
+| `$RUN/app.sock` | envoy-in → server 的 UDS（仅双跳）|
 
 > **三级拓扑刻意共用 15006**，不是省事：本环境的 920B 开着 firewalld 且没有 root
 > 改不了规则，实测只有 15006 放行，另开的 15008 从 950 连过去报
@@ -969,6 +969,27 @@ stop() {
 它是 `tr.Close()` 打印的。**这一行不在，就说明 Close() 没跑完，数据不可信**；
 `丢弃` 非 0 则说明 channel 满过（`emit` 是非阻塞投递，满了直接丢）。
 
+> **2026-08-10 起这行本身也修过一次**：`Tracer.Close()` 原来用
+> `closed.Swap(true)` 提前返回，与信号 goroutine 的 `os.Exit(0)` 抢跑 ——
+> 数据刷成功了但这行没打出来，三轮复现一轮。改用 `sync.Once.Do` 后，
+> 后到的调用者会阻塞等前者跑完。**「行不在」曾经 ≠「数据不全」，现在是了。**
+
+**Envoy 两跳有各自的判据行**（2026-08-10 新增，此前 Envoy 侧压根不上报）：
+
+```
+[probe] node=envoy-out host=suzhou950 记录=20000 落盘=20000 丢弃=0 下游写未归属=0
+```
+
+| 节点 | 判据 |
+|---|---|
+| Kitex 两侧 | `丢弃 = 0` |
+| Envoy 两跳 | `记录 == 落盘` **且** `丢弃 = 0` **且** `下游写未归属 = 0` |
+
+**两侧都不要数行数。** Kitex 侧是因为采样率与并发让期望行数算不出来；
+Envoy 侧还多一条：`onWriteReady` 每条 trace 触发多次（第 1 次是真正发送，
+之后是缓冲区已排空的空写），事件数是浮动的 —— 要数就数**去重后的点位名**
+（当前 client 29 / envoy-out 24 / envoy-in 24 / server 30）。
+
 > **对本次复现结论的影响：无。** 归因阶梯用的是跨机的 20 秒压测轮
 > （每级 1.3–2 万条 trace），远超 1 MB 缓冲，一直在正常落盘；
 > 受影响的只有几百请求的**同机验证轮**，而那一级只用来判断链路通不通。
@@ -1054,7 +1075,7 @@ tgt=$(TOPO=single ./scripts/run-cross-machine.sh target)
 
 ```bash
 ./bin/client \
-  -target /tmp/kitex-demo/out.sock \   # UDS 路径或 host:port
+  -target "$RUN/out.sock" \             # 默认值即 $RUN/out.sock，通常不用写
   -service echo-server \               # 写入 TTHeader 的 ToService，供 Envoy 路由
   -c 16 \                              # 并发
   -d 60s \                             # 时长；-d 0 时改用 -n 指定请求数
@@ -1088,7 +1109,7 @@ sleep 5
 
 **正确顺序永远是**：`stop` → 清理 → `start` → 压测 → `stop` → `collect`。
 
-### 8.2 三个关于文件的坑
+### 8.2 四个关于文件的坑
 
 **① Envoy 按线程分文件。** 实际文件名是 `trace-envoy-out.ndjson.<tid>`，
 不是 `trace-envoy-out.ndjson`。**用 `*.ndjson*` 通配，用 `*.ndjson` 一个都匹配不到。**
@@ -1102,6 +1123,22 @@ sleep 5
 （client 495 MB + server 409 MB + 上百个 Envoy 分线程文件）。
 `/tmp` 是 tmpfs 的话，这 1 GB 直接占内存。
 
+**④ 运行目录必须按用户隔离，别用写死的 `/tmp/kitex-demo`。**
+suzhou950/920B 是**共享开发机**。2026-08-10 撞过一次：另一个用户同时在跑同一套
+实验，两台机器的 `/tmp/kitex-demo` 全变成他的文件。我方进程写不进去（sticky 位挡着），
+**而 `collect` 照样把对方的 588 MB trace 拉了回来** —— 数据看着「有」，只是不是自己的，
+全程没有任何报错。差点拿去分析。
+
+现在脚本与 demo 默认用 `/tmp/kitex-demo-$(id -un)`，可用 `MESHLAB_RUN` /
+`MESHLAB_PEER_RUN` 覆盖。**手工起进程或写分析脚本时也要用它**：
+
+```bash
+RUN=${MESHLAB_RUN:-/tmp/kitex-demo-$(id -un)}
+```
+
+Envoy 的 bootstrap 里 UDS 路径是写死的，且 Envoy 不做环境变量替换 ——
+`run-cross-machine.sh` 每轮用 `sed` 生成一份临时配置到 `$RUN/conf`，不必手工处理。
+
 ---
 
 ## 9. 第 6 步：分析
@@ -1110,8 +1147,11 @@ sleep 5
 
 ```bash
 cd ~/envoy_kitex/mesh-lab/demo
-FILES="/tmp/kitex-demo/trace-client.ndjson /tmp/kitex-demo/trace-server.ndjson \
-       /tmp/kitex-demo/trace-envoy-out.ndjson.* /tmp/kitex-demo/trace-envoy-in.ndjson.*"
+# 运行目录**按用户隔离**（2026-08-10 起）。写死 /tmp/kitex-demo 会撞车：
+# 这两台是共享开发机，撞过一次 —— 见 §8.2。
+RUN=${MESHLAB_RUN:-/tmp/kitex-demo-$(id -un)}
+FILES="$RUN/trace-client.ndjson $RUN/trace-server.ndjson \
+       $RUN/trace-envoy-out.ndjson.* $RUN/trace-envoy-in.ndjson.*"
 
 ./bin/merge -format detail $FILES                              # 分阶段分位数
 ./bin/merge -format table -limit 0 $FILES > trace-table.csv    # 全量逐条 CSV
@@ -1120,7 +1160,7 @@ FILES="/tmp/kitex-demo/trace-client.ndjson /tmp/kitex-demo/trace-server.ndjson \
 
 | 格式 | 用途 |
 |---|---|
-| `summary` | 各节点总时长，最粗 |
+| **`summary`** | **端到端分解：各节点自身 + 各段往返，相加等于 100%**（下半部分保留各节点观测区间，嵌套不可加）|
 | **`detail`** | **各阶段分位数，日常主力** |
 | **`table`** | **逐条 trace 的 CSV，导进 pandas 自己筛** |
 | `waterfall` | 单条请求的瀑布图，排查个案 |
@@ -1294,8 +1334,8 @@ diff -q /tmp/skew.txt /tmp/noskew.txt && echo "✅ 完全一致 —— 分析对
 ```bash
 ./scripts/run-cross-machine.sh stop
 sleep 5
-rm -rf /tmp/kitex-demo
-ssh 192.168.25.51 'rm -rf /tmp/kitex-demo'
+rm -rf /tmp/kitex-demo-$(id -un)
+ssh 192.168.25.51 "rm -rf /tmp/kitex-demo-\$(id -un)"
 ```
 
 ### 10.2 彻底清空重来
@@ -1316,8 +1356,8 @@ for p in ~/bazel_out ~/go ~/.cache/bazel ~/.cache/go-build; do
   rm -rf "$p"
   [ -e "$p" ] && echo "!!! $p 没删干净" || echo "$p 已删除"
 done
-rm -rf ~/envoy_kitex ~/sdk ~/bin ~/dl /tmp/kitex-demo
-ssh 192.168.25.51 'rm -rf ~/meshlab /tmp/kitex-demo'
+rm -rf ~/envoy_kitex ~/sdk ~/bin ~/dl /tmp/kitex-demo-$(id -un)
+ssh 192.168.25.51 "rm -rf ~/meshlab /tmp/kitex-demo-\$(id -un)"
 ```
 
 **每步都验证删掉了**，别信退出码。
@@ -1362,7 +1402,7 @@ ssh 192.168.25.51 'rm -rf ~/meshlab /tmp/kitex-demo'
 ## 附录 A：本次复现的完整时间线
 
 2026-08-07，两台机器先清空到只剩系统（`~/bazel_out`、`~/.cache/bazel`、
-`~/envoy_kitex`、`~/sdk`、`~/go`、`~/bin`、`/tmp/kitex-demo` 全删），
+`~/envoy_kitex`、`~/sdk`、`~/go`、`~/bin`、`/tmp/kitex-demo-$(id -un)` 全删），
 从下载 Go 开始：
 
 | 时刻 | 阶段 | 用时 | 结果 |
@@ -1486,7 +1526,7 @@ cd ~/envoy_kitex/mesh-lab
 for r in 1 2 3; do
   for topo in direct single two; do
     TOPO=$topo ./scripts/run-cross-machine.sh stop >/dev/null 2>&1; sleep 2
-    rm -rf /tmp/kitex-demo; mkdir -p /tmp/kitex-demo
+    rm -rf "$RUN"; mkdir -p "$RUN"
     TOPO=$topo ./scripts/run-cross-machine.sh start >/dev/null 2>&1
     TOPO=$topo ./scripts/run-cross-machine.sh status >/dev/null || { echo "$topo r$r 未起来"; continue; }
     tgt=$(TOPO=$topo ./scripts/run-cross-machine.sh target)
@@ -1495,7 +1535,7 @@ for r in 1 2 3; do
     # 顺序不能换：stop（线程退出才刷盘）→ collect（拉回对端数据）
     TOPO=$topo ./scripts/run-cross-machine.sh stop >/dev/null 2>&1; sleep 5
     TOPO=$topo ./scripts/run-cross-machine.sh collect >/dev/null 2>&1
-    mkdir -p ~/ladder/$topo/r$r && mv /tmp/kitex-demo/trace-* ~/ladder/$topo/r$r/
+    mkdir -p ~/ladder/$topo/r$r && mv "$RUN"/trace-* ~/ladder/$topo/r$r/
   done
 done
 
@@ -1507,11 +1547,14 @@ sleep 5
 
 # ───────── 11. 分析 ─────────
 cd demo
-FILES="/tmp/kitex-demo/trace-client.ndjson /tmp/kitex-demo/trace-server.ndjson \
-       /tmp/kitex-demo/trace-envoy-out.ndjson.* /tmp/kitex-demo/trace-envoy-in.ndjson.*"
+# 运行目录**按用户隔离**（2026-08-10 起）。写死 /tmp/kitex-demo 会撞车：
+# 这两台是共享开发机，撞过一次 —— 见 §8.2。
+RUN=${MESHLAB_RUN:-/tmp/kitex-demo-$(id -un)}
+FILES="$RUN/trace-client.ndjson $RUN/trace-server.ndjson \
+       $RUN/trace-envoy-out.ndjson.* $RUN/trace-envoy-in.ndjson.*"
 ./bin/merge -format summary  $FILES
-./bin/merge -format detail   $FILES | tee /tmp/kitex-demo/detail.txt
-./bin/merge -format table -limit 0 $FILES > /tmp/kitex-demo/trace-table.csv
+./bin/merge -format detail   $FILES | tee "$RUN/detail.txt"
+./bin/merge -format table -limit 0 $FILES > "$RUN/trace-table.csv"
 ./bin/merge -format waterfall -limit 1 $FILES
 # 时钟偏斜自检：两次输出应逐字节相同
 ./bin/merge -format detail --inject-skew kitex-server=+50 $FILES > /tmp/skew.txt

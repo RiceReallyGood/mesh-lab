@@ -440,7 +440,8 @@ Envoy 报"解码失败"时,不要靠推测协议格式 —— 直接看 Kitex �
 `mesh-lab/tools/udsdump` 是个 UDS 透明转发代理,把双向字节流原样 hexdump:
 
 ```bash
-udsdump -listen /tmp/kitex-demo/dump.sock -upstream /tmp/kitex-demo/app.sock
+RUN=${MESHLAB_RUN:-/tmp/kitex-demo-$(id -un)}
+udsdump -listen "$RUN/dump.sock" -upstream "$RUN/app.sock"
 # 然后让 client 打 dump.sock
 ```
 

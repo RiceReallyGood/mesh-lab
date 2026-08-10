@@ -213,7 +213,8 @@ ENVOY_CONCURRENCY=2 ./scripts/run-cross-machine.sh start
 
 ```bash
 ./bin/client \
-  -target /tmp/kitex-demo/out.sock \   # UDS 路径或 host:port
+  -target "$RUN/out.sock" \             # 默认值即 $RUN/out.sock，通常不用写
+  -service echo-server \               # 写入 TTHeader ToService，供 Envoy 路由
   -service echo-server \               # 写入 TTHeader ToService，供 Envoy 路由
   -c 16 \                              # 并发
   -d 60s \                             # 时长；-d 0 时改用 -n 指定请求数
@@ -259,6 +260,40 @@ sleep 5
 **③ 数据量不小。** 60 秒 5% 采样、40k QPS 会产出约 1 GB（client 495 MB + server 409 MB +
 上百个 Envoy 分线程文件）。磁盘要留够。
 
+### 4.3 完整性怎么判
+
+**四个节点统一 `grep "\[probe\]"` 就能查完**，两侧语义不同：
+
+```
+[probe] node=kitex-client 总请求=1000 采样=1000 丢弃=0
+[probe] node=envoy-out    host=suzhou950  记录=20000 落盘=20000 丢弃=0 下游写未归属=0
+[probe] node=envoy-in     host=suzhou920B 记录=20000 落盘=20000 丢弃=0 下游写未归属=0
+[probe] node=kitex-server 总请求=1000 采样=1000 丢弃=0
+```
+
+| 节点 | 判据 |
+|---|---|
+| Kitex 两侧 | `丢弃 = 0` |
+| Envoy 两跳 | `记录 == 落盘` **且** `丢弃 = 0` **且** `下游写未归属 = 0` |
+
+`下游写未归属` 不为零说明连接上出现了流水线，此时**只有下游 writev 那两段不完整**，
+其余点位不受影响（原理见 `probe-points.md`）。
+
+**不要数事件数。** Envoy 的 `onWriteReady` 每条 trace 会触发多次（第 1 次是真正
+发送，之后是缓冲区已排空的空写），所以事件数是浮动的；要数就数**去重后的点位名**：
+
+```bash
+python3 -c "
+import json,collections,sys
+per=collections.defaultdict(set)
+for l in open(sys.argv[1]):
+    d=json.loads(l); per[d['trace']].add(d['point'])
+print(collections.Counter(len(v) for v in per.values()))
+" "$RUN/trace-envoy-out.ndjson."*
+```
+
+当前应为：client 29 / envoy-out 24 / envoy-in 24 / server 30。
+
 ---
 
 ## 5. 分析
@@ -267,7 +302,7 @@ sleep 5
 
 | 格式 | 用途 |
 |---|---|
-| `summary` | 各节点总时长，最粗 |
+| **`summary`** | **端到端分解：各节点自身 + 各段往返，相加等于 100%**。下半部分保留各节点观测区间（嵌套，不可加）|
 | **`detail`** | **各阶段分位数，日常主力** |
 | **`table`** | **逐条 trace 的 CSV，导进表格/pandas 自己筛** |
 | `waterfall` | 单条请求的瀑布图，排查个案 |
@@ -275,8 +310,10 @@ sleep 5
 
 ```bash
 cd ~/envoy_kitex/mesh-lab/demo
-FILES="/tmp/kitex-demo/trace-client.ndjson /tmp/kitex-demo/trace-server.ndjson \
-       /tmp/kitex-demo/trace-envoy-out.ndjson.* /tmp/kitex-demo/trace-envoy-in.ndjson.*"
+# 运行目录按用户隔离（§3.4 的 MESHLAB_RUN），别再写死 /tmp/kitex-demo
+RUN=${MESHLAB_RUN:-/tmp/kitex-demo-$(id -un)}
+FILES="$RUN/trace-client.ndjson $RUN/trace-server.ndjson \
+       $RUN/trace-envoy-out.ndjson.* $RUN/trace-envoy-in.ndjson.*"
 
 ./bin/merge -format detail $FILES              # 分阶段分位数
 ./bin/merge -format table -limit 0 $FILES > trace-table.csv   # 全量 CSV
@@ -357,7 +394,7 @@ ENVOY_CONCURRENCY=2 ./scripts/run-cross-machine.sh start
 # ── 压测 ──
 cd demo
 KITEX_PROBE_HOST=suzhou950 ./bin/client \
-    -target /tmp/kitex-demo/out.sock -service echo-server \
+    -service echo-server \
     -c 64 -d 40s -sample 0.05
 
 # ── 收数据（顺序不能换）──
@@ -368,10 +405,12 @@ sleep 5
 
 # ── 分析 ──
 cd demo
-FILES="/tmp/kitex-demo/trace-client.ndjson /tmp/kitex-demo/trace-server.ndjson \
-       /tmp/kitex-demo/trace-envoy-out.ndjson.* /tmp/kitex-demo/trace-envoy-in.ndjson.*"
-./bin/merge -format detail $FILES | tee /tmp/kitex-demo/detail.txt
-./bin/merge -format table -limit 0 $FILES > /tmp/kitex-demo/trace-table.csv
+# 运行目录按用户隔离（§3.4 的 MESHLAB_RUN），别再写死 /tmp/kitex-demo
+RUN=${MESHLAB_RUN:-/tmp/kitex-demo-$(id -un)}
+FILES="$RUN/trace-client.ndjson $RUN/trace-server.ndjson \
+       $RUN/trace-envoy-out.ndjson.* $RUN/trace-envoy-in.ndjson.*"
+./bin/merge -format detail $FILES | tee "$RUN/detail.txt"
+./bin/merge -format table -limit 0 $FILES > "$RUN/trace-table.csv"
 ```
 
 做对照实验（改代码前后、换网卡前后）时，**必须按轮次交错跑，不能一组跑完再跑另一组** ——

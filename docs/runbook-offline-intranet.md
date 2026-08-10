@@ -349,7 +349,7 @@ cp -r envoy-conf scripts ~/envoy_kitex/mesh-lab/
 **② 不摆布局，直接手工起进程**——见 §3.4，你需要自己处理 §3.2 那三条。
 
 **Envoy 配置里的路径不用改**：实测 6 份 YAML 里出现的绝对路径**全部**在
-`/tmp/kitex-demo/` 下（`out.sock`、`app.sock`、access log），没有任何 `$HOME` 硬编码。
+`$RUN/` 下（`out.sock`、`app.sock`、access log），没有任何 `$HOME` 硬编码。
 只有当你的 `/tmp` 不可写、或要换目录时才需要 `sed` 一遍。
 
 ### 3.2 三个必须的细节，少一个就跑不起来
@@ -382,22 +382,24 @@ cp -r envoy-conf scripts ~/envoy_kitex/mesh-lab/
 
 ```bash
 # 准备
-mkdir -p /tmp/kitex-demo && ulimit -n 65536
+# 运行目录按用户隔离 —— 共享机上写死 /tmp/kitex-demo 会与他人撞车
+RUN=${MESHLAB_RUN:-/tmp/kitex-demo-$(id -un)}
+mkdir -p "$RUN" && ulimit -n 65536
 cd ~/meshlab
 
 # 终端 1：server
 KITEX_PROBE_HOST=$(hostname) \
-  ./bin/server -addr /tmp/kitex-demo/app.sock -trace /tmp/kitex-demo/trace-server.ndjson
+  ./bin/server -addr "$RUN/app.sock" -trace "$RUN/trace-server.ndjson"
 
 # 终端 2：envoy（tmux 里跑）
 KITEX_PROBE_HOST=$(hostname) \
-KITEX_PROBE_PATH=/tmp/kitex-demo/trace-envoy.ndjson \
+KITEX_PROBE_PATH="$RUN/trace-envoy.ndjson" \
 KITEX_PROBE_NODE=envoy \
   ./bin/envoy-static -c ./envoy-conf/single-hop.yaml --log-level info --base-id 1
 
 # 终端 3：压测
 KITEX_PROBE_HOST=$(hostname) \
-  ./bin/client -target /tmp/kitex-demo/out.sock -service echo-server \
+  ./bin/client -target "$RUN/out.sock" -service echo-server \
                -n 300 -d 0 -c 1 -sample 1.0
 ```
 
@@ -436,8 +438,8 @@ pkill -x envoy-static; pkill -x server; sleep 5
 
 # 2) 分析。注意 Envoy 按线程分文件，文件名带 .<tid>，必须用 *.ndjson* 通配
 cd ~/meshlab
-FILES="/tmp/kitex-demo/trace-client.ndjson /tmp/kitex-demo/trace-server.ndjson \
-       /tmp/kitex-demo/trace-envoy*.ndjson*"
+FILES="$RUN/trace-client.ndjson $RUN/trace-server.ndjson \
+       $RUN/trace-envoy*.ndjson*"
 ./bin/merge -format summary   $FILES
 ./bin/merge -format detail    $FILES
 ./bin/merge -format waterfall -limit 3 $FILES
@@ -447,7 +449,7 @@ FILES="/tmp/kitex-demo/trace-client.ndjson /tmp/kitex-demo/trace-server.ndjson \
 **数据完整性的判据是这一行，不是数行数**：
 
 ```bash
-grep '\[probe\]' /tmp/kitex-demo/server.log
+grep '\[probe\]' "$RUN"/*.log      # 四个节点的判据行都在这些日志里
 # [probe] node=kitex-server 总请求=300 采样=300 丢弃=0
 ```
 
@@ -611,14 +613,15 @@ cp bin/{server,client,merge} ~/envoy_kitex/mesh-lab/demo/bin/
 cp -r envoy-conf scripts ~/envoy_kitex/mesh-lab/
 
 # 3. 跑（同机单跳，最快的连通性验证）
-ulimit -n 65536 && mkdir -p /tmp/kitex-demo
+RUN=${MESHLAB_RUN:-/tmp/kitex-demo-$(id -un)}
+ulimit -n 65536 && mkdir -p "$RUN"
 cd ~/envoy_kitex/mesh-lab && ./scripts/run-single-hop.sh start && ./scripts/run-single-hop.sh status
 cd demo && KITEX_PROBE_HOST=$(hostname) ./bin/client -n 300 -d 0 -c 1 -sample 1.0
 
 # 4. 停 + 分析（顺序不能换）
 cd .. && ./scripts/run-single-hop.sh stop && sleep 5
-cd demo && ./bin/merge -format detail /tmp/kitex-demo/trace-client.ndjson \
-    /tmp/kitex-demo/trace-server.ndjson /tmp/kitex-demo/trace-envoy*.ndjson*
+cd demo && ./bin/merge -format detail "$RUN/trace-client.ndjson" \
+    "$RUN/trace-server.ndjson" "$RUN"/trace-envoy*.ndjson*
 ```
 
 **判断成功的三个信号：**

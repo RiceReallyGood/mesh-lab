@@ -973,6 +973,11 @@ Kitex server 端有 unlink 处理(`trans_server.go:69` 分支),Envoy 侧需确�
 
 **处理**:sock 一律放 `/tmp/kitex-demo/` 下的短路径,不使用带长随机后缀的目录。
 
+> **2026-08-10 变更**：sock 与 trace 的落地目录已改为 **按用户隔离**的
+> `/tmp/kitex-demo-$(id -un)`（可用 `MESHLAB_RUN` 覆盖）。原因是 suzhou950/920B
+> 是共享开发机，写死路径与另一用户撞过一次，且 `collect` 会静默把对方的数据拉回来。
+> 本设计文档保留原始写法作为历史记录，实际操作以 `runbook-reproduce.md` §8.2 ④ 为准。
+
 ### 9.5 `ulimit -n` 默认 1024
 
 对 bazel 构建和 Envoy 高并发运行都偏低。
