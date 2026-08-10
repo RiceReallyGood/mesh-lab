@@ -127,8 +127,14 @@ func NewTracer(path, node string) (*Tracer, error) {
 // 因此这里要**避免覆盖已有槽位**：服务端走到这里时 ctx 上已经挂着取好的快照，
 // 再 WithNetpollProbe 一次会把它清成空的。
 func (t *Tracer) Start(ctx context.Context) context.Context {
+	// 写路径槽位：**两侧都在这里挂**。写发生时 trace 早已绑定，采样状态已知，
+	// 所以不像读侧那样要分客户端/服务端两套开法。
+	// 服务端此刻还读不到 traceparent（下面 sampled 为假），但写探针要到
+	// Write() 才用得上，那时 rpcinfo 里已有 —— 所以无条件挂，代价是一个空结构体。
+	ctx, _ = stats.WithNetpollWriteProbe(ctx)
+
 	if stats.NetpollProbeFrom(ctx) != nil {
-		return ctx // 服务端：OnRead 已挂好快照
+		return ctx // 服务端：读侧快照已由 OnRead 挂好
 	}
 	if _, sampled := traceContextFrom(ctx); !sampled {
 		return ctx
@@ -178,6 +184,7 @@ func (t *Tracer) Finish(ctx context.Context) {
 	}
 
 	t.emitNetpoll(ctx, traceID)
+	t.emitNetpollWrite(ctx, traceID)
 }
 
 // emitNetpoll 输出 netpoll 内部读路径的各阶段时刻。
@@ -206,6 +213,53 @@ func (t *Tracer) emitNetpoll(ctx context.Context, traceID string) {
 		{"mesh_np_readv_start", p.ReadvStart},
 		{"mesh_np_readv_done", p.ReadvDone},
 		{"mesh_np_trigger", p.Trigger},
+	} {
+		if np.ts.IsZero() {
+			continue
+		}
+		t.emit(&Event{
+			Host:   t.host,
+			Node:   t.node,
+			Trace:  traceID,
+			Point:  np.name,
+			WallNs: np.ts.UnixNano(),
+			MonoNs: int64(np.ts.Sub(monoBase)),
+			Attrs:  attrs,
+		})
+	}
+}
+
+// emitNetpollWrite 输出 netpoll 内部**写**路径的各阶段时刻。
+//
+// 与读路径两点不同：
+//
+//  1. 时刻全部由 RPC goroutine 自己在 Flush 里采集，不跨 goroutine，
+//     所以**不按 Consistent 整体丢弃** —— 逐个判零即可。整体门控只会把
+//     「哪一段没记上」这个信息一起吞掉。
+//  2. 因此它**不能挂在 emitNetpoll 末尾**：读探针无效时那边会提前 return，
+//     会把写路径一起带走。两者相互独立，各调各的。
+func (t *Tracer) emitNetpollWrite(ctx context.Context, traceID string) {
+	p := stats.NetpollWriteProbeFrom(ctx)
+	if p == nil {
+		return
+	}
+	// writes>1 说明发生了部分写；waited 说明走了 EPOLLOUT 慢路径 ——
+	// 那时 writev_done→flush_done 混着等待，不能读成「缓冲区回收」。
+	// 原样带出让分析侧决定，不在这里悄悄丢弃。
+	attrs := map[string]string{
+		"writes":     strconv.FormatInt(p.Writes, 10),
+		"waited":     strconv.FormatBool(p.Waited),
+		"consistent": strconv.FormatBool(p.Consistent),
+	}
+
+	for _, np := range []struct {
+		name string
+		ts   time.Time
+	}{
+		{"mesh_np_flush_start", p.FlushStart},
+		{"mesh_np_writev_start", p.WritevStart},
+		{"mesh_np_writev_done", p.WritevDone},
+		{"mesh_np_flush_done", p.FlushDone},
 	} {
 		if np.ts.IsZero() {
 			continue

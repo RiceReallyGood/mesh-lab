@@ -1,329 +1,353 @@
 
-╔══ trace 00085fc6bf0acd94 ══
-║  涉及 4 个节点，2 台主机（跨机，时长仅在同机内精确）
-║
-║ ┌─ host=suzhou950  节点: kitex-client + envoy-out   原点 = 本机最早事件
-║ │       0ns  kitex-client   rpc_start
-║ │     1.0µs  kitex-client   client_conn_start
-║ │     1.2µs  kitex-client   client_conn_finish
-║ │     2.9µs  kitex-client   write_start
-║ │     3.6µs  kitex-client   mesh_hdr_encode_start
-║ │     3.7µs  kitex-client   mesh_hdr_encode_finish
-║ │     3.8µs  kitex-client   mesh_payload_encode_start
-║ │     4.1µs  kitex-client   mesh_payload_encode_finish
-║ │     4.2µs  kitex-client   mesh_socket_write_start
-║ │     6.1µs  kitex-client   mesh_socket_write_finish
-║ │     6.2µs  kitex-client   write_finish
-║ │     6.3µs  kitex-client   read_start
-║ │     6.5µs  kitex-client   mesh_socket_read_start
-║ │     8.2µs  envoy-out      dn_epoll_wake  ◀ 距上一行 1.6µs
-║ │     8.3µs  envoy-out      dn_readv_start
-║ │    10.5µs  envoy-out      dn_readv_done
-║ │    10.6µs  envoy-out      dn_first_byte
-║ │    13.5µs  envoy-out      hdr_decoded
-║ │    14.0µs  envoy-out      msg_begin
-║ │    14.4µs  envoy-out      route_resolved
-║ │    16.1µs  envoy-out      up_conn_reused
-║ │    20.9µs  envoy-out      up_encode_done
-║ │    21.1µs  envoy-out      up_socket_write_done
-║ │    21.2µs  envoy-out      up_write_done
-║ │    21.6µs  envoy-out      req_done
-║ │   202.1µs  envoy-out      up_epoll_wake
-║ │   202.3µs  envoy-out      up_readv_start
-║ │   205.8µs  envoy-out      up_readv_done
-║ │   206.0µs  envoy-out      up_first_byte
-║ │   210.2µs  envoy-out      resp_decoded
-║ │   210.9µs  envoy-out      dn_encode_done
-║ │   211.1µs  envoy-out      dn_socket_write_done
-║ │   211.3µs  envoy-out      rpc_done
-║ │   221.6µs  kitex-client   mesh_np_epoll_wake  ◀ 距上一行 10.3µs
-║ │   221.8µs  kitex-client   mesh_np_dispatch
-║ │   221.9µs  kitex-client   mesh_np_readv_start
-║ │   224.4µs  kitex-client   mesh_np_readv_done
-║ │   224.5µs  kitex-client   mesh_np_trigger
-║ │   227.1µs  kitex-client   mesh_first_byte
-║ │   227.2µs  kitex-client   mesh_hdr_decode_start
-║ │   227.8µs  kitex-client   mesh_hdr_decode_finish
-║ │   228.2µs  kitex-client   wait_read_start
-║ │   228.7µs  kitex-client   wait_read_finish
-║ │   230.7µs  kitex-client   read_finish
-║ │   232.9µs  kitex-client   rpc_finish
-║ └─
-║
-║  ╌╌╌ 跨机分隔：以下是另一台机器，时间轴独立，与上面不可对齐 ╌╌╌
-║ ┌─ host=suzhou920B  节点: envoy-in + kitex-server   原点 = 本机最早事件
-║ │       0ns  envoy-in       dn_epoll_wake
-║ │     470ns  envoy-in       dn_readv_start
-║ │     3.9µs  envoy-in       dn_readv_done
-║ │     4.2µs  envoy-in       dn_first_byte
-║ │     9.1µs  envoy-in       hdr_decoded
-║ │    10.1µs  envoy-in       msg_begin
-║ │    11.1µs  envoy-in       route_resolved
-║ │    14.5µs  envoy-in       up_conn_reused
-║ │    22.3µs  envoy-in       up_encode_done
-║ │    23.1µs  envoy-in       up_socket_write_done
-║ │    23.3µs  envoy-in       up_write_done
-║ │    24.2µs  envoy-in       req_done
-║ │    33.5µs  kitex-server   mesh_np_epoll_wake  ◀ 距上一行 9.3µs
-║ │    33.8µs  kitex-server   mesh_np_dispatch
-║ │    34.1µs  kitex-server   mesh_np_readv_start
-║ │    40.5µs  kitex-server   mesh_np_readv_done
-║ │    40.6µs  kitex-server   mesh_np_trigger
-║ │    47.4µs  kitex-server   mesh_netpoll_onread
-║ │    48.0µs  kitex-server   rpc_start
-║ │    48.3µs  kitex-server   read_start
-║ │    48.6µs  kitex-server   mesh_socket_read_start
-║ │    48.9µs  kitex-server   mesh_first_byte
-║ │    49.0µs  kitex-server   mesh_hdr_decode_start
-║ │    50.5µs  kitex-server   mesh_hdr_decode_finish
-║ │    51.5µs  kitex-server   wait_read_start
-║ │    52.0µs  kitex-server   wait_read_finish
-║ │    53.7µs  kitex-server   read_finish
-║ │    57.3µs  kitex-server   server_handle_start
-║ │    57.6µs  kitex-server   server_handle_finish
-║ │    58.1µs  kitex-server   write_start
-║ │    58.9µs  kitex-server   mesh_hdr_encode_start
-║ │    59.0µs  kitex-server   mesh_hdr_encode_finish
-║ │    59.1µs  kitex-server   mesh_payload_encode_start
-║ │    59.7µs  kitex-server   mesh_payload_encode_finish
-║ │    59.9µs  kitex-server   mesh_socket_write_start
-║ │    65.0µs  kitex-server   mesh_socket_write_finish
-║ │    65.1µs  kitex-server   write_finish
-║ │    65.3µs  kitex-server   rpc_finish
-║ │    68.1µs  envoy-in       up_epoll_wake  ◀ 距上一行 2.9µs
-║ │    68.4µs  envoy-in       up_readv_start
-║ │    74.3µs  envoy-in       up_readv_done
-║ │    74.7µs  envoy-in       up_first_byte
-║ │    82.1µs  envoy-in       resp_decoded
-║ │    83.2µs  envoy-in       dn_encode_done
-║ │    83.8µs  envoy-in       dn_socket_write_done
-║ │    84.1µs  envoy-in       rpc_done
-║ └─
-║
-║ ⇄ 链路开销（往返，含两跳 sidecar 与网络）
-║     client 观测总时长   232.9µs
-║     server 观测处理时长 31.7µs
-║     ── 差值 ──────────  201.2µs
-║     跨机：此值为往返总和，无法拆分单向（§8.2.4）
-║     两项各自在本机用单调钟测量，相减时时钟偏斜抵消，
-║     因此该结果对任意大小的时钟差都成立。
-╚══
-
-╔══ trace 004ed18ecdf490ec ══
-║  涉及 4 个节点，2 台主机（跨机，时长仅在同机内精确）
-║
-║ ┌─ host=suzhou950  节点: kitex-client + envoy-out   原点 = 本机最早事件
-║ │       0ns  kitex-client   rpc_start
-║ │     890ns  kitex-client   client_conn_start
-║ │     1.1µs  kitex-client   client_conn_finish
-║ │     2.0µs  kitex-client   write_start
-║ │     2.8µs  kitex-client   mesh_hdr_encode_start
-║ │     2.9µs  kitex-client   mesh_hdr_encode_finish
-║ │     3.0µs  kitex-client   mesh_payload_encode_start
-║ │     3.3µs  kitex-client   mesh_payload_encode_finish
-║ │     3.4µs  kitex-client   mesh_socket_write_start
-║ │     5.0µs  kitex-client   mesh_socket_write_finish
-║ │     5.2µs  kitex-client   write_finish
-║ │     5.3µs  kitex-client   read_start
-║ │     5.5µs  kitex-client   mesh_socket_read_start
-║ │     6.7µs  envoy-out      dn_epoll_wake  ◀ 距上一行 1.2µs
-║ │     6.8µs  envoy-out      dn_readv_start
-║ │     8.9µs  envoy-out      dn_readv_done
-║ │     9.0µs  envoy-out      dn_first_byte
-║ │    12.0µs  envoy-out      hdr_decoded
-║ │    12.5µs  envoy-out      msg_begin
-║ │    12.9µs  envoy-out      route_resolved
-║ │    14.6µs  envoy-out      up_conn_reused
-║ │    19.2µs  envoy-out      up_encode_done
-║ │    19.4µs  envoy-out      up_socket_write_done
-║ │    19.5µs  envoy-out      up_write_done
-║ │    20.0µs  envoy-out      req_done
-║ │   196.9µs  envoy-out      up_epoll_wake
-║ │   197.1µs  envoy-out      up_readv_start
-║ │   200.9µs  envoy-out      up_readv_done
-║ │   201.1µs  envoy-out      up_first_byte
-║ │   205.7µs  envoy-out      resp_decoded
-║ │   206.3µs  envoy-out      dn_encode_done
-║ │   206.5µs  envoy-out      dn_socket_write_done
-║ │   206.8µs  envoy-out      rpc_done
-║ │   219.2µs  kitex-client   mesh_np_epoll_wake  ◀ 距上一行 12.4µs
-║ │   219.4µs  kitex-client   mesh_np_dispatch
-║ │   219.6µs  kitex-client   mesh_np_readv_start
-║ │   222.4µs  kitex-client   mesh_np_readv_done
-║ │   222.6µs  kitex-client   mesh_np_trigger
-║ │   225.9µs  kitex-client   mesh_first_byte
-║ │   226.2µs  kitex-client   mesh_hdr_decode_start
-║ │   227.2µs  kitex-client   mesh_hdr_decode_finish
-║ │   227.9µs  kitex-client   wait_read_start
-║ │   228.4µs  kitex-client   wait_read_finish
-║ │   229.5µs  kitex-client   read_finish
-║ │   231.2µs  kitex-client   rpc_finish
-║ └─
-║
-║  ╌╌╌ 跨机分隔：以下是另一台机器，时间轴独立，与上面不可对齐 ╌╌╌
-║ ┌─ host=suzhou920B  节点: envoy-in + kitex-server   原点 = 本机最早事件
-║ │       0ns  envoy-in       dn_epoll_wake
-║ │     450ns  envoy-in       dn_readv_start
-║ │     3.7µs  envoy-in       dn_readv_done
-║ │     4.0µs  envoy-in       dn_first_byte
-║ │     9.0µs  envoy-in       hdr_decoded
-║ │    10.0µs  envoy-in       msg_begin
-║ │    10.9µs  envoy-in       route_resolved
-║ │    14.3µs  envoy-in       up_conn_reused
-║ │    22.3µs  envoy-in       up_encode_done
-║ │    23.0µs  envoy-in       up_socket_write_done
-║ │    23.2µs  envoy-in       up_write_done
-║ │    24.2µs  envoy-in       req_done
-║ │    32.4µs  kitex-server   mesh_np_epoll_wake  ◀ 距上一行 8.3µs
-║ │    33.0µs  kitex-server   mesh_np_dispatch
-║ │    33.4µs  kitex-server   mesh_np_readv_start
-║ │    37.8µs  kitex-server   mesh_np_readv_done
-║ │    38.0µs  kitex-server   mesh_np_trigger
-║ │    45.9µs  kitex-server   mesh_netpoll_onread
-║ │    46.5µs  kitex-server   rpc_start
-║ │    46.8µs  kitex-server   read_start
-║ │    47.3µs  kitex-server   mesh_socket_read_start
-║ │    47.7µs  kitex-server   mesh_first_byte
-║ │    47.8µs  kitex-server   mesh_hdr_decode_start
-║ │    49.6µs  kitex-server   mesh_hdr_decode_finish
-║ │    50.7µs  kitex-server   wait_read_start
-║ │    51.3µs  kitex-server   wait_read_finish
-║ │    53.1µs  kitex-server   read_finish
-║ │    56.6µs  kitex-server   server_handle_start
-║ │    56.9µs  kitex-server   server_handle_finish
-║ │    57.5µs  kitex-server   write_start
-║ │    58.6µs  kitex-server   mesh_hdr_encode_start
-║ │    58.6µs  kitex-server   mesh_hdr_encode_finish
-║ │    58.7µs  kitex-server   mesh_payload_encode_start
-║ │    59.3µs  kitex-server   mesh_payload_encode_finish
-║ │    59.5µs  kitex-server   mesh_socket_write_start
-║ │    62.4µs  kitex-server   mesh_socket_write_finish
-║ │    62.5µs  kitex-server   write_finish
-║ │    62.7µs  kitex-server   rpc_finish
-║ │    64.0µs  envoy-in       up_epoll_wake  ◀ 距上一行 1.3µs
-║ │    64.3µs  envoy-in       up_readv_start
-║ │    68.2µs  envoy-in       up_readv_done
-║ │    68.6µs  envoy-in       up_first_byte
-║ │    75.9µs  envoy-in       resp_decoded
-║ │    77.0µs  envoy-in       dn_encode_done
-║ │    77.6µs  envoy-in       dn_socket_write_done
-║ │    77.9µs  envoy-in       rpc_done
-║ └─
-║
-║ ⇄ 链路开销（往返，含两跳 sidecar 与网络）
-║     client 观测总时长   231.2µs
-║     server 观测处理时长 30.2µs
-║     ── 差值 ──────────  201.0µs
-║     跨机：此值为往返总和，无法拆分单向（§8.2.4）
-║     两项各自在本机用单调钟测量，相减时时钟偏斜抵消，
-║     因此该结果对任意大小的时钟差都成立。
-╚══
-
-╔══ trace 006ad5e816f34940 ══
+╔══ trace 009c16862b242004 ══
 ║  涉及 4 个节点，2 台主机（跨机，时长仅在同机内精确）
 ║
 ║ ┌─ host=suzhou950  节点: kitex-client + envoy-out   原点 = 本机最早事件
 ║ │       0ns  kitex-client   rpc_start
 ║ │     1.1µs  kitex-client   client_conn_start
 ║ │     1.4µs  kitex-client   client_conn_finish
-║ │     2.4µs  kitex-client   write_start
-║ │     3.5µs  kitex-client   mesh_hdr_encode_start
-║ │     3.5µs  kitex-client   mesh_hdr_encode_finish
-║ │     3.6µs  kitex-client   mesh_payload_encode_start
-║ │     4.0µs  kitex-client   mesh_payload_encode_finish
-║ │     4.1µs  kitex-client   mesh_socket_write_start
-║ │     6.2µs  kitex-client   mesh_socket_write_finish
-║ │     6.3µs  kitex-client   write_finish
-║ │     6.5µs  kitex-client   read_start
-║ │     6.8µs  kitex-client   mesh_socket_read_start
-║ │     8.3µs  envoy-out      dn_epoll_wake  ◀ 距上一行 1.5µs
-║ │     8.4µs  envoy-out      dn_readv_start
-║ │    10.6µs  envoy-out      dn_readv_done
-║ │    10.7µs  envoy-out      dn_first_byte
-║ │    13.6µs  envoy-out      hdr_decoded
-║ │    14.2µs  envoy-out      msg_begin
-║ │    14.6µs  envoy-out      route_resolved
-║ │    16.3µs  envoy-out      up_conn_reused
-║ │    21.0µs  envoy-out      up_encode_done
-║ │    21.2µs  envoy-out      up_socket_write_done
-║ │    21.3µs  envoy-out      up_write_done
-║ │    21.9µs  envoy-out      req_done
-║ │   203.0µs  envoy-out      up_epoll_wake
-║ │   203.1µs  envoy-out      up_readv_start
-║ │   206.7µs  envoy-out      up_readv_done
-║ │   206.8µs  envoy-out      up_first_byte
-║ │   211.2µs  envoy-out      resp_decoded
-║ │   211.8µs  envoy-out      dn_encode_done
-║ │   212.1µs  envoy-out      dn_socket_write_done
-║ │   212.3µs  envoy-out      rpc_done
-║ │   223.1µs  kitex-client   mesh_np_epoll_wake  ◀ 距上一行 10.8µs
-║ │   223.3µs  kitex-client   mesh_np_dispatch
-║ │   223.4µs  kitex-client   mesh_np_readv_start
-║ │   225.9µs  kitex-client   mesh_np_readv_done
-║ │   226.0µs  kitex-client   mesh_np_trigger
-║ │   228.6µs  kitex-client   mesh_first_byte
-║ │   228.7µs  kitex-client   mesh_hdr_decode_start
-║ │   229.3µs  kitex-client   mesh_hdr_decode_finish
-║ │   229.8µs  kitex-client   wait_read_start
-║ │   231.2µs  kitex-client   wait_read_finish
-║ │   232.9µs  kitex-client   read_finish
-║ │   234.0µs  kitex-client   rpc_finish
+║ │     2.2µs  kitex-client   write_start
+║ │     3.0µs  kitex-client   mesh_hdr_encode_start
+║ │     3.0µs  kitex-client   mesh_hdr_encode_finish
+║ │     3.1µs  kitex-client   mesh_payload_encode_start
+║ │     3.5µs  kitex-client   mesh_payload_encode_finish
+║ │     3.6µs  kitex-client   mesh_socket_write_start
+║ │     3.7µs  kitex-client   mesh_np_flush_start
+║ │     3.8µs  kitex-client   mesh_np_writev_start
+║ │     5.5µs  kitex-client   mesh_np_writev_done
+║ │     5.5µs  kitex-client   mesh_np_flush_done
+║ │     5.6µs  kitex-client   mesh_socket_write_finish
+║ │     5.8µs  kitex-client   write_finish
+║ │     6.0µs  kitex-client   read_start
+║ │     6.2µs  kitex-client   mesh_socket_read_start
+║ │     6.9µs  envoy-out      dn_epoll_wake  ◀ 距上一行 700ns
+║ │     7.0µs  envoy-out      dn_readv_start
+║ │     9.2µs  envoy-out      dn_readv_done
+║ │     9.3µs  envoy-out      dn_first_byte
+║ │    12.3µs  envoy-out      hdr_decoded
+║ │    12.8µs  envoy-out      msg_begin
+║ │    13.2µs  envoy-out      route_resolved
+║ │    14.8µs  envoy-out      up_conn_reused
+║ │    19.5µs  envoy-out      up_encode_done
+║ │    19.8µs  envoy-out      up_socket_write_done
+║ │    19.9µs  envoy-out      up_write_done
+║ │    20.3µs  envoy-out      req_done
+║ │   193.4µs  envoy-out      up_epoll_wake
+║ │   193.5µs  envoy-out      up_readv_start
+║ │   197.1µs  envoy-out      up_readv_done
+║ │   197.2µs  envoy-out      up_first_byte
+║ │   201.6µs  envoy-out      resp_decoded
+║ │   202.3µs  envoy-out      dn_encode_done
+║ │   202.5µs  envoy-out      dn_socket_write_done
+║ │   202.8µs  envoy-out      rpc_done
+║ │   214.0µs  kitex-client   mesh_np_epoll_wake  ◀ 距上一行 11.2µs
+║ │   214.2µs  kitex-client   mesh_np_dispatch
+║ │   214.3µs  kitex-client   mesh_np_readv_start
+║ │   217.2µs  kitex-client   mesh_np_readv_done
+║ │   217.2µs  kitex-client   mesh_np_trigger
+║ │   219.9µs  kitex-client   mesh_first_byte
+║ │   220.0µs  kitex-client   mesh_hdr_decode_start
+║ │   220.6µs  kitex-client   mesh_hdr_decode_finish
+║ │   221.2µs  kitex-client   wait_read_start
+║ │   221.6µs  kitex-client   wait_read_finish
+║ │   223.6µs  kitex-client   read_finish
+║ │   224.8µs  kitex-client   rpc_finish
+║ └─
+║
+║  ╌╌╌ 跨机分隔：以下是另一台机器，时间轴独立，与上面不可对齐 ╌╌╌
+║ ┌─ host=suzhou920B  节点: envoy-in + kitex-server   原点 = 本机最早事件
+║ │       0ns  envoy-in       dn_epoll_wake
+║ │     380ns  envoy-in       dn_readv_start
+║ │     3.5µs  envoy-in       dn_readv_done
+║ │     3.7µs  envoy-in       dn_first_byte
+║ │     8.3µs  envoy-in       hdr_decoded
+║ │     9.2µs  envoy-in       msg_begin
+║ │    10.0µs  envoy-in       route_resolved
+║ │    13.2µs  envoy-in       up_conn_reused
+║ │    20.4µs  envoy-in       up_encode_done
+║ │    21.2µs  envoy-in       up_socket_write_done
+║ │    21.3µs  envoy-in       up_write_done
+║ │    22.2µs  envoy-in       req_done
+║ │    30.6µs  kitex-server   mesh_np_epoll_wake  ◀ 距上一行 8.4µs
+║ │    30.9µs  kitex-server   mesh_np_dispatch
+║ │    31.2µs  kitex-server   mesh_np_readv_start
+║ │    35.9µs  kitex-server   mesh_np_readv_done
+║ │    36.1µs  kitex-server   mesh_np_trigger
+║ │    43.5µs  kitex-server   mesh_netpoll_onread
+║ │    44.1µs  kitex-server   rpc_start
+║ │    44.5µs  kitex-server   read_start
+║ │    44.9µs  kitex-server   mesh_socket_read_start
+║ │    45.2µs  kitex-server   mesh_first_byte
+║ │    45.3µs  kitex-server   mesh_hdr_decode_start
+║ │    47.3µs  kitex-server   mesh_hdr_decode_finish
+║ │    48.3µs  kitex-server   wait_read_start
+║ │    48.8µs  kitex-server   wait_read_finish
+║ │    49.9µs  kitex-server   read_finish
+║ │    55.0µs  kitex-server   server_handle_start
+║ │    55.2µs  kitex-server   server_handle_finish
+║ │    55.8µs  kitex-server   write_start
+║ │    56.7µs  kitex-server   mesh_hdr_encode_start
+║ │    56.8µs  kitex-server   mesh_hdr_encode_finish
+║ │    56.9µs  kitex-server   mesh_payload_encode_start
+║ │    57.4µs  kitex-server   mesh_payload_encode_finish
+║ │    57.8µs  kitex-server   mesh_socket_write_start
+║ │    57.8µs  kitex-server   mesh_np_flush_start
+║ │    57.9µs  kitex-server   mesh_np_writev_start
+║ │    61.3µs  kitex-server   mesh_np_writev_done
+║ │    61.4µs  kitex-server   mesh_np_flush_done
+║ │    61.5µs  kitex-server   mesh_socket_write_finish
+║ │    61.8µs  kitex-server   write_finish
+║ │    62.0µs  kitex-server   rpc_finish
+║ │    63.5µs  envoy-in       up_epoll_wake  ◀ 距上一行 1.6µs
+║ │    63.8µs  envoy-in       up_readv_start
+║ │    68.4µs  envoy-in       up_readv_done
+║ │    68.8µs  envoy-in       up_first_byte
+║ │    75.5µs  envoy-in       resp_decoded
+║ │    76.5µs  envoy-in       dn_encode_done
+║ │    77.1µs  envoy-in       dn_socket_write_done
+║ │    77.4µs  envoy-in       rpc_done
+║ └─
+║
+║ ⇄ 链路开销（往返，含两跳 sidecar 与网络）
+║     client 观测总时长   224.8µs
+║     server 观测处理时长 31.4µs
+║     ── 差值 ──────────  193.4µs
+║     跨机：此值为往返总和，无法拆分单向（§8.2.4）
+║     两项各自在本机用单调钟测量，相减时时钟偏斜抵消，
+║     因此该结果对任意大小的时钟差都成立。
+╚══
+
+╔══ trace 009e3a8b821e1b74 ══
+║  涉及 4 个节点，2 台主机（跨机，时长仅在同机内精确）
+║
+║ ┌─ host=suzhou950  节点: kitex-client + envoy-out   原点 = 本机最早事件
+║ │       0ns  kitex-client   rpc_start
+║ │     3.4µs  kitex-client   client_conn_start
+║ │     3.7µs  kitex-client   client_conn_finish
+║ │     5.0µs  kitex-client   write_start
+║ │     5.8µs  kitex-client   mesh_hdr_encode_start
+║ │     5.9µs  kitex-client   mesh_hdr_encode_finish
+║ │     6.0µs  kitex-client   mesh_payload_encode_start
+║ │     6.4µs  kitex-client   mesh_payload_encode_finish
+║ │     6.5µs  kitex-client   mesh_socket_write_start
+║ │     6.5µs  kitex-client   mesh_np_flush_start
+║ │     6.6µs  kitex-client   mesh_np_writev_start
+║ │     8.7µs  kitex-client   mesh_np_writev_done
+║ │     8.7µs  kitex-client   mesh_np_flush_done
+║ │     8.8µs  kitex-client   mesh_socket_write_finish
+║ │     9.0µs  kitex-client   write_finish
+║ │     9.2µs  kitex-client   read_start
+║ │     9.5µs  kitex-client   mesh_socket_read_start
+║ │    10.4µs  envoy-out      dn_epoll_wake  ◀ 距上一行 850ns
+║ │    10.5µs  envoy-out      dn_readv_start
+║ │    12.6µs  envoy-out      dn_readv_done
+║ │    12.7µs  envoy-out      dn_first_byte
+║ │    15.6µs  envoy-out      hdr_decoded
+║ │    16.1µs  envoy-out      msg_begin
+║ │    16.5µs  envoy-out      route_resolved
+║ │    18.1µs  envoy-out      up_conn_reused
+║ │    22.7µs  envoy-out      up_encode_done
+║ │    23.0µs  envoy-out      up_socket_write_done
+║ │    23.1µs  envoy-out      up_write_done
+║ │    23.5µs  envoy-out      req_done
+║ │   193.0µs  envoy-out      up_epoll_wake
+║ │   193.2µs  envoy-out      up_readv_start
+║ │   196.7µs  envoy-out      up_readv_done
+║ │   196.9µs  envoy-out      up_first_byte
+║ │   201.0µs  envoy-out      resp_decoded
+║ │   201.7µs  envoy-out      dn_encode_done
+║ │   201.9µs  envoy-out      dn_socket_write_done
+║ │   202.1µs  envoy-out      rpc_done
+║ │   213.1µs  kitex-client   mesh_np_epoll_wake  ◀ 距上一行 11.0µs
+║ │   213.3µs  kitex-client   mesh_np_dispatch
+║ │   213.4µs  kitex-client   mesh_np_readv_start
+║ │   216.2µs  kitex-client   mesh_np_readv_done
+║ │   216.3µs  kitex-client   mesh_np_trigger
+║ │   219.0µs  kitex-client   mesh_first_byte
+║ │   219.1µs  kitex-client   mesh_hdr_decode_start
+║ │   219.8µs  kitex-client   mesh_hdr_decode_finish
+║ │   220.2µs  kitex-client   wait_read_start
+║ │   220.7µs  kitex-client   wait_read_finish
+║ │   222.3µs  kitex-client   read_finish
+║ │   223.3µs  kitex-client   rpc_finish
+║ └─
+║
+║  ╌╌╌ 跨机分隔：以下是另一台机器，时间轴独立，与上面不可对齐 ╌╌╌
+║ ┌─ host=suzhou920B  节点: envoy-in + kitex-server   原点 = 本机最早事件
+║ │       0ns  envoy-in       dn_epoll_wake
+║ │     390ns  envoy-in       dn_readv_start
+║ │     3.4µs  envoy-in       dn_readv_done
+║ │     3.6µs  envoy-in       dn_first_byte
+║ │     8.1µs  envoy-in       hdr_decoded
+║ │     9.0µs  envoy-in       msg_begin
+║ │     9.8µs  envoy-in       route_resolved
+║ │    13.2µs  envoy-in       up_conn_reused
+║ │    20.4µs  envoy-in       up_encode_done
+║ │    21.1µs  envoy-in       up_socket_write_done
+║ │    21.3µs  envoy-in       up_write_done
+║ │    22.3µs  envoy-in       req_done
+║ │    30.8µs  kitex-server   mesh_np_epoll_wake  ◀ 距上一行 8.5µs
+║ │    31.2µs  kitex-server   mesh_np_dispatch
+║ │    31.5µs  kitex-server   mesh_np_readv_start
+║ │    36.4µs  kitex-server   mesh_np_readv_done
+║ │    36.6µs  kitex-server   mesh_np_trigger
+║ │    43.7µs  kitex-server   mesh_netpoll_onread
+║ │    44.2µs  kitex-server   rpc_start
+║ │    44.6µs  kitex-server   read_start
+║ │    45.0µs  kitex-server   mesh_socket_read_start
+║ │    45.3µs  kitex-server   mesh_first_byte
+║ │    45.4µs  kitex-server   mesh_hdr_decode_start
+║ │    47.3µs  kitex-server   mesh_hdr_decode_finish
+║ │    48.5µs  kitex-server   wait_read_start
+║ │    49.0µs  kitex-server   wait_read_finish
+║ │    50.3µs  kitex-server   read_finish
+║ │    53.1µs  kitex-server   server_handle_start
+║ │    53.4µs  kitex-server   server_handle_finish
+║ │    53.9µs  kitex-server   write_start
+║ │    54.7µs  kitex-server   mesh_hdr_encode_start
+║ │    54.8µs  kitex-server   mesh_hdr_encode_finish
+║ │    54.9µs  kitex-server   mesh_payload_encode_start
+║ │    55.5µs  kitex-server   mesh_payload_encode_finish
+║ │    55.9µs  kitex-server   mesh_socket_write_start
+║ │    55.9µs  kitex-server   mesh_np_flush_start
+║ │    56.1µs  kitex-server   mesh_np_writev_start
+║ │    59.4µs  kitex-server   mesh_np_writev_done
+║ │    59.5µs  kitex-server   mesh_np_flush_done
+║ │    59.7µs  kitex-server   mesh_socket_write_finish
+║ │    60.0µs  kitex-server   write_finish
+║ │    60.2µs  kitex-server   rpc_finish
+║ │    61.9µs  envoy-in       up_epoll_wake  ◀ 距上一行 1.7µs
+║ │    62.3µs  envoy-in       up_readv_start
+║ │    66.8µs  envoy-in       up_readv_done
+║ │    67.2µs  envoy-in       up_first_byte
+║ │    74.0µs  envoy-in       resp_decoded
+║ │    75.0µs  envoy-in       dn_encode_done
+║ │    75.5µs  envoy-in       dn_socket_write_done
+║ │    75.8µs  envoy-in       rpc_done
+║ └─
+║
+║ ⇄ 链路开销（往返，含两跳 sidecar 与网络）
+║     client 观测总时长   223.3µs
+║     server 观测处理时长 29.4µs
+║     ── 差值 ──────────  193.9µs
+║     跨机：此值为往返总和，无法拆分单向（§8.2.4）
+║     两项各自在本机用单调钟测量，相减时时钟偏斜抵消，
+║     因此该结果对任意大小的时钟差都成立。
+╚══
+
+╔══ trace 00d14fbf3724184c ══
+║  涉及 4 个节点，2 台主机（跨机，时长仅在同机内精确）
+║
+║ ┌─ host=suzhou950  节点: kitex-client + envoy-out   原点 = 本机最早事件
+║ │       0ns  kitex-client   rpc_start
+║ │     960ns  kitex-client   client_conn_start
+║ │     1.2µs  kitex-client   client_conn_finish
+║ │     2.1µs  kitex-client   write_start
+║ │     2.8µs  kitex-client   mesh_hdr_encode_start
+║ │     2.9µs  kitex-client   mesh_hdr_encode_finish
+║ │     2.9µs  kitex-client   mesh_payload_encode_start
+║ │     3.2µs  kitex-client   mesh_payload_encode_finish
+║ │     3.4µs  kitex-client   mesh_socket_write_start
+║ │     3.4µs  kitex-client   mesh_np_flush_start
+║ │     3.5µs  kitex-client   mesh_np_writev_start
+║ │     5.4µs  kitex-client   mesh_np_writev_done
+║ │     5.4µs  kitex-client   mesh_np_flush_done
+║ │     5.5µs  kitex-client   mesh_socket_write_finish
+║ │     5.7µs  kitex-client   write_finish
+║ │     5.9µs  kitex-client   read_start
+║ │     6.1µs  kitex-client   mesh_socket_read_start
+║ │     6.8µs  envoy-out      dn_epoll_wake  ◀ 距上一行 770ns
+║ │     7.0µs  envoy-out      dn_readv_start
+║ │     9.1µs  envoy-out      dn_readv_done
+║ │     9.2µs  envoy-out      dn_first_byte
+║ │    12.2µs  envoy-out      hdr_decoded
+║ │    12.6µs  envoy-out      msg_begin
+║ │    13.1µs  envoy-out      route_resolved
+║ │    14.6µs  envoy-out      up_conn_reused
+║ │    19.2µs  envoy-out      up_encode_done
+║ │    19.5µs  envoy-out      up_socket_write_done
+║ │    19.6µs  envoy-out      up_write_done
+║ │    20.1µs  envoy-out      req_done
+║ │   196.1µs  envoy-out      up_epoll_wake
+║ │   196.2µs  envoy-out      up_readv_start
+║ │   200.9µs  envoy-out      up_readv_done
+║ │   201.1µs  envoy-out      up_first_byte
+║ │   205.3µs  envoy-out      resp_decoded
+║ │   206.0µs  envoy-out      dn_encode_done
+║ │   206.2µs  envoy-out      dn_socket_write_done
+║ │   206.4µs  envoy-out      rpc_done
+║ │   218.1µs  kitex-client   mesh_np_epoll_wake  ◀ 距上一行 11.6µs
+║ │   218.4µs  kitex-client   mesh_np_dispatch
+║ │   218.6µs  kitex-client   mesh_np_readv_start
+║ │   221.7µs  kitex-client   mesh_np_readv_done
+║ │   221.9µs  kitex-client   mesh_np_trigger
+║ │   224.1µs  kitex-client   mesh_first_byte
+║ │   224.2µs  kitex-client   mesh_hdr_decode_start
+║ │   225.2µs  kitex-client   mesh_hdr_decode_finish
+║ │   226.0µs  kitex-client   wait_read_start
+║ │   226.8µs  kitex-client   wait_read_finish
+║ │   228.4µs  kitex-client   read_finish
+║ │   230.0µs  kitex-client   rpc_finish
 ║ └─
 ║
 ║  ╌╌╌ 跨机分隔：以下是另一台机器，时间轴独立，与上面不可对齐 ╌╌╌
 ║ ┌─ host=suzhou920B  节点: envoy-in + kitex-server   原点 = 本机最早事件
 ║ │       0ns  envoy-in       dn_epoll_wake
 ║ │     430ns  envoy-in       dn_readv_start
-║ │     3.8µs  envoy-in       dn_readv_done
-║ │     4.0µs  envoy-in       dn_first_byte
-║ │     9.0µs  envoy-in       hdr_decoded
-║ │    10.0µs  envoy-in       msg_begin
-║ │    11.0µs  envoy-in       route_resolved
-║ │    14.8µs  envoy-in       up_conn_reused
-║ │    22.7µs  envoy-in       up_encode_done
-║ │    23.6µs  envoy-in       up_socket_write_done
-║ │    23.8µs  envoy-in       up_write_done
-║ │    24.9µs  envoy-in       req_done
-║ │    34.0µs  kitex-server   mesh_np_epoll_wake  ◀ 距上一行 9.2µs
-║ │    34.3µs  kitex-server   mesh_np_dispatch
-║ │    34.6µs  kitex-server   mesh_np_readv_start
-║ │    41.0µs  kitex-server   mesh_np_readv_done
-║ │    41.1µs  kitex-server   mesh_np_trigger
-║ │    48.4µs  kitex-server   mesh_netpoll_onread
-║ │    49.0µs  kitex-server   rpc_start
-║ │    49.3µs  kitex-server   read_start
-║ │    49.7µs  kitex-server   mesh_socket_read_start
-║ │    50.0µs  kitex-server   mesh_first_byte
-║ │    50.1µs  kitex-server   mesh_hdr_decode_start
-║ │    51.7µs  kitex-server   mesh_hdr_decode_finish
-║ │    52.8µs  kitex-server   wait_read_start
-║ │    53.3µs  kitex-server   wait_read_finish
-║ │    55.0µs  kitex-server   read_finish
-║ │    58.4µs  kitex-server   server_handle_start
-║ │    58.6µs  kitex-server   server_handle_finish
-║ │    59.1µs  kitex-server   write_start
-║ │    59.9µs  kitex-server   mesh_hdr_encode_start
-║ │    60.0µs  kitex-server   mesh_hdr_encode_finish
-║ │    60.1µs  kitex-server   mesh_payload_encode_start
-║ │    60.7µs  kitex-server   mesh_payload_encode_finish
-║ │    60.8µs  kitex-server   mesh_socket_write_start
-║ │    65.6µs  kitex-server   mesh_socket_write_finish
-║ │    65.8µs  kitex-server   write_finish
-║ │    65.9µs  kitex-server   rpc_finish
-║ │    68.9µs  envoy-in       up_epoll_wake  ◀ 距上一行 2.9µs
-║ │    69.2µs  envoy-in       up_readv_start
-║ │    74.9µs  envoy-in       up_readv_done
-║ │    75.3µs  envoy-in       up_first_byte
-║ │    82.8µs  envoy-in       resp_decoded
-║ │    83.8µs  envoy-in       dn_encode_done
-║ │    84.5µs  envoy-in       dn_socket_write_done
-║ │    84.8µs  envoy-in       rpc_done
+║ │     3.4µs  envoy-in       dn_readv_done
+║ │     3.6µs  envoy-in       dn_first_byte
+║ │     8.1µs  envoy-in       hdr_decoded
+║ │     9.0µs  envoy-in       msg_begin
+║ │     9.9µs  envoy-in       route_resolved
+║ │    13.2µs  envoy-in       up_conn_reused
+║ │    22.4µs  envoy-in       up_encode_done
+║ │    23.1µs  envoy-in       up_socket_write_done
+║ │    23.4µs  envoy-in       up_write_done
+║ │    24.4µs  envoy-in       req_done
+║ │    32.4µs  kitex-server   mesh_np_epoll_wake  ◀ 距上一行 8.0µs
+║ │    32.8µs  kitex-server   mesh_np_dispatch
+║ │    33.2µs  kitex-server   mesh_np_readv_start
+║ │    38.1µs  kitex-server   mesh_np_readv_done
+║ │    38.3µs  kitex-server   mesh_np_trigger
+║ │    45.5µs  kitex-server   mesh_netpoll_onread
+║ │    46.2µs  kitex-server   rpc_start
+║ │    46.6µs  kitex-server   read_start
+║ │    47.1µs  kitex-server   mesh_socket_read_start
+║ │    47.4µs  kitex-server   mesh_first_byte
+║ │    47.5µs  kitex-server   mesh_hdr_decode_start
+║ │    49.2µs  kitex-server   mesh_hdr_decode_finish
+║ │    50.7µs  kitex-server   wait_read_start
+║ │    51.3µs  kitex-server   wait_read_finish
+║ │    52.5µs  kitex-server   read_finish
+║ │    55.3µs  kitex-server   server_handle_start
+║ │    55.6µs  kitex-server   server_handle_finish
+║ │    56.2µs  kitex-server   write_start
+║ │    57.1µs  kitex-server   mesh_hdr_encode_start
+║ │    57.2µs  kitex-server   mesh_hdr_encode_finish
+║ │    57.3µs  kitex-server   mesh_payload_encode_start
+║ │    57.9µs  kitex-server   mesh_payload_encode_finish
+║ │    58.2µs  kitex-server   mesh_socket_write_start
+║ │    58.2µs  kitex-server   mesh_np_flush_start
+║ │    58.4µs  kitex-server   mesh_np_writev_start
+║ │    61.7µs  kitex-server   mesh_np_writev_done
+║ │    61.8µs  kitex-server   mesh_np_flush_done
+║ │    61.9µs  kitex-server   mesh_socket_write_finish
+║ │    62.2µs  kitex-server   write_finish
+║ │    62.3µs  kitex-server   rpc_finish
+║ │    64.3µs  envoy-in       up_epoll_wake  ◀ 距上一行 2.0µs
+║ │    64.6µs  envoy-in       up_readv_start
+║ │    69.2µs  envoy-in       up_readv_done
+║ │    69.6µs  envoy-in       up_first_byte
+║ │    76.5µs  envoy-in       resp_decoded
+║ │    77.5µs  envoy-in       dn_encode_done
+║ │    78.0µs  envoy-in       dn_socket_write_done
+║ │    78.3µs  envoy-in       rpc_done
 ║ └─
 ║
 ║ ⇄ 链路开销（往返，含两跳 sidecar 与网络）
-║     client 观测总时长   234.0µs
-║     server 观测处理时长 31.9µs
-║     ── 差值 ──────────  202.1µs
+║     client 观测总时长   230.0µs
+║     server 观测处理时长 30.0µs
+║     ── 差值 ──────────  200.0µs
 ║     跨机：此值为往返总和，无法拆分单向（§8.2.4）
 ║     两项各自在本机用单调钟测量，相减时时钟偏斜抵消，
 ║     因此该结果对任意大小的时钟差都成立。

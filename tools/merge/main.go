@@ -61,6 +61,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "区间定义有误:", err)
 		os.Exit(2)
 	}
+	if err := checkNetCols(phases(), netCols()); err != nil {
+		fmt.Fprintln(os.Stderr, "网络单程列定义有误:", err)
+		os.Exit(2)
+	}
 
 	if flag.NArg() == 0 {
 		fmt.Fprintln(os.Stderr, "用法: merge [选项] <trace1.ndjson> [trace2.ndjson ...]")
@@ -840,7 +844,14 @@ func kitexClientPhases() []phase {
 		{"kitex-client", "编码(发送前)", "write_start", "mesh_socket_write_start"},
 		{"kitex-client", "   ├ TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
 		{"kitex-client", "   └ payload编码", "mesh_payload_encode_start", "mesh_payload_encode_finish"},
-		{"kitex-client", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
+				{"kitex-client", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
+		// ↓ 把 netpoll 的 Flush 拆开。此前这一整段是个黑盒，
+		//   「Go 侧写 socket 比 Envoy 贵 7–10 倍」只能观察到现象、无法归因。
+		//   waited=true 的样本（走了 EPOLLOUT 慢路径）里最后一段混着等待，
+		//   attrs 已带出，分析时按需过滤。
+		{"kitex-client", "   ├ LinkBuffer整理+拼iovec", "mesh_np_flush_start", "mesh_np_writev_start"},
+		{"kitex-client", "   ├ ★writev系统调用", "mesh_np_writev_start", "mesh_np_writev_done"},
+		{"kitex-client", "   └ 缓冲区回收", "mesh_np_writev_done", "mesh_np_flush_done"},
 		{"kitex-client", "读取+解码(整段)", "read_start", "read_finish"},
 		{"kitex-client", "   ├ ★等待对端(纯网络)", "mesh_socket_read_start", "mesh_first_byte"},
 		// ↓ netpoll 内部拆解。只在客户端可用（采样判定必须早于阻塞读，
@@ -885,7 +896,14 @@ func kitexServerPhases() []phase {
 		{"kitex-server", "编码(发送前)", "write_start", "mesh_socket_write_start"},
 		{"kitex-server", "   ├ TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
 		{"kitex-server", "   └ payload编码", "mesh_payload_encode_start", "mesh_payload_encode_finish"},
-		{"kitex-server", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
+				{"kitex-server", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
+		// ↓ 把 netpoll 的 Flush 拆开。此前这一整段是个黑盒，
+		//   「Go 侧写 socket 比 Envoy 贵 7–10 倍」只能观察到现象、无法归因。
+		//   waited=true 的样本（走了 EPOLLOUT 慢路径）里最后一段混着等待，
+		//   attrs 已带出，分析时按需过滤。
+		{"kitex-server", "   ├ LinkBuffer整理+拼iovec", "mesh_np_flush_start", "mesh_np_writev_start"},
+		{"kitex-server", "   ├ ★writev系统调用", "mesh_np_writev_start", "mesh_np_writev_done"},
+		{"kitex-server", "   └ 缓冲区回收", "mesh_np_writev_done", "mesh_np_flush_done"},
 	}
 }
 
@@ -897,14 +915,59 @@ func kitexServerPhases() []phase {
 // 两处显示成一模一样的数值、n=2000。
 //
 // 与其指望下次还能看出 n= 不对，不如让它直接起不来。
+// phaseKey 把区间名归一成稳定的标识：剥掉树形缩进（空格与 ├└│─ 这些画线字符）。
+//
+// 区间名里带缩进是为了在 detail 里表达父子关系，但那纯属显示。**任何按名字
+// 做的查找都必须先归一**，否则调整一次缩进就会静默改掉键 —— 踩过一次：
+// 「★等待对端(纯网络)」挪到「读取+解码(整段)」底下加了 "   ├ " 前缀，
+// netCols() 那边还写着旧名，于是 net.client↔envoy-out 整列 NaN、29 行全空。
+// 光 TrimSpace 不够，├ 不是空白字符。
+func phaseKey(s string) string {
+	return strings.TrimSpace(strings.TrimLeft(s, " \t│├└─"))
+}
+
 func checkPhaseNames(ph []phase) error {
 	seen := map[string]bool{}
+	trimmed := map[string]bool{}
 	for _, p := range ph {
 		key := p.node + "|" + p.name
 		if seen[key] {
 			return fmt.Errorf("区间重名: %s —— 同名会被静默合并成一个桶，必须改名", key)
 		}
 		seen[key] = true
+		// 去掉树形缩进后也必须唯一：table 的列名走 colName()，那里会 TrimSpace，
+		// 两个只差缩进的区间会产生同一个 CSV 列，后者静默覆盖前者。
+		tk := p.node + "|" + phaseKey(p.name)
+		if trimmed[tk] {
+			return fmt.Errorf("区间去缩进后重名: %s —— CSV 列名会撞车，必须改名", tk)
+		}
+		trimmed[tk] = true
+	}
+	return nil
+}
+
+// checkNetCols 保证每个网络单程列都能在 phases() 里找到它依赖的区间。
+//
+// 这两处是**分开写的字符串**，改了一边忘了另一边不会报错，只会让整列变空。
+// 实测踩过：detail 把「★等待对端(纯网络)」挪到「读取+解码(整段)」底下、
+// 名字前加了树形缩进，而 netCols() 还写着没缩进的旧名 ——
+// net.client↔envoy-out单程(UDS) 整列 NaN，29 行全空，没有任何提示。
+//
+// 现在查找已按去缩进后的名字匹配，这道自检再挡一层拼写与改名。
+func checkNetCols(ph []phase, nc []netCol) error {
+	have := map[string]bool{}
+	nodes := map[string]bool{}
+	for _, p := range ph {
+		have[p.node+"|"+phaseKey(p.name)] = true
+		nodes[p.node] = true
+	}
+	for _, c := range nc {
+		if !have[c.outerNode+"|"+phaseKey(c.outerPhase)] {
+			return fmt.Errorf("%s 依赖的区间不存在: %s|%s", c.name, c.outerNode, c.outerPhase)
+		}
+		if !nodes[c.innerNode] {
+			return fmt.Errorf("%s 依赖的内层节点不存在: %s", c.name, c.innerNode)
+		}
 	}
 	return nil
 }
@@ -1067,7 +1130,7 @@ func colName(node, phase string) string {
 	for _, junk := range []string{"①→②", "②→③", "③→④", "④→⑤", "⑤→⑥", "⑥→⑦", "④→", "├", "└", "★"} {
 		s = strings.ReplaceAll(s, junk, "")
 	}
-	return node + "." + strings.TrimSpace(s)
+	return node + "." + phaseKey(s)
 }
 
 func printTable(traces map[string][]Event, ids []string, limit int) {
@@ -1120,7 +1183,7 @@ func printTable(traces map[string][]Event, ids []string, limit int) {
 				a, oka := at[p.from]
 				b, okb := at[p.to]
 				if oka && okb && b >= a {
-					nodePhase[p.node+"|"+p.name] = b - a
+					nodePhase[p.node+"|"+phaseKey(p.name)] = b - a
 					if i, ok := idx[colName(p.node, p.name)]; ok {
 						vals[i] = float64(b-a) / 1000
 					}
@@ -1130,7 +1193,7 @@ func printTable(traces map[string][]Event, ids []string, limit int) {
 
 		// 网络单程 = (外层等待 − 内层总时长) / 2
 		for _, c := range nc {
-			wait, okw := nodePhase[c.outerNode+"|"+c.outerPhase]
+			wait, okw := nodePhase[c.outerNode+"|"+phaseKey(c.outerPhase)]
 			inner, oki := nodeTotal[c.innerNode]
 			if okw && oki {
 				vals[idx[c.name]] = float64(wait-inner) / 2 / 1000

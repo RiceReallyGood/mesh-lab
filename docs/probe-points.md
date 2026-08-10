@@ -257,7 +257,7 @@ merge 的 detail 用缩进表达这层嵌套。
 
 ---
 
-## 二·五、netpoll 内部(5 个点,**两侧都有**)
+## 二·五、netpoll 内部(读 5 点 + 写 4 点,**两侧都有**)
 
 Kitex 客户端阻塞在 `Peek` 上等响应,这一段占端到端 95% 以上,但它是个黑盒:
 里面混着「对端真没回」「回了但 epoll 没轮到」「读完了但 goroutine 没被调度」三件事,
@@ -296,6 +296,37 @@ if needTrigger && ... { markTrigger(); c.triggerRead(nil) }   // 客户端走这
 | `mesh_np_epoll_wake` → `mesh_np_dispatch` | poller 事件循环内排队 |
 | `mesh_np_readv_start` → `_done` | socket 收包 |
 | **`mesh_np_trigger` → `mesh_first_byte`**(client)<br>**`mesh_np_trigger` → `mesh_netpoll_onread`**(server) | ★ **goroutine 调度延迟**。整套插桩里唯一能量出「数据到了但没被调度起来」的地方。服务端取 `mesh_netpoll_onread` 是因为那才是它用户态的第一个时刻 |
+
+### 写路径(4 个点,2026-08-10 新增)
+
+| 点位 | netpoll 位置 | 含义 |
+|---|---|---|
+| `mesh_np_flush_start` | `connection.Flush()` 入口 | netpoll 写路径起点 |
+| `mesh_np_writev_start` / `_done` | `flush()` 里 `sendmsg` 前后 | **真正的系统调用** |
+| `mesh_np_flush_done` | `flush()` 返回前 | 缓冲区回收完成 |
+
+由此得到:
+
+| 段 | 含义 | 实测 avg(client/server) |
+|---|---|---|
+| `flush_start` → `writev_start` | LinkBuffer 链表整理 + 拼 iovec | 99 ns / 152 ns |
+| **`writev_start` → `writev_done`** | ★ **sendmsg 系统调用** | **1.9 µs / 3.2 µs** |
+| `writev_done` → `flush_done` | Skip/Release 缓冲区回收 | 57 ns / 92 ns |
+
+**写路径比读路径简单得多**,因为它全程在 RPC goroutine 上同步执行,
+既不跨 goroutine(不需要一致性校验),采样状态也早已确定(trace 已绑定),
+所以两侧都能精确按 RPC 开关,未采样零开销。
+
+attrs 带出两个标志:`writes` 是 sendmsg 调用次数(>1 表示部分写),
+`waited` 表示走了 EPOLLOUT 慢路径。**慢路径没有拆开** —— 后续的写发生在
+poller 的 `outputs`/`outputAck` 上。小报文实测 `writes=1`、`waited=false`,
+1000/1000 都走快路径。
+
+> **不要拿这三段去和 Envoy 的「写socket」比。** Envoy 的
+> `up_encode_done → up_socket_write_done` 括住的是 `ConnectionImpl::write()`,
+> 而那只做「`write_buffer_->move(data)` + `activateFileEvents`」——
+> **真正的 writev 在 `onWriteReady()` 里,由事件循环稍后执行,目前没有点位**。
+> 详见 `probe-coverage-audit.md` §二。
 
 ### 两侧的开关方式完全不同
 

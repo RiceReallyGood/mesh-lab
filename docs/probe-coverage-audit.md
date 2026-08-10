@@ -15,7 +15,7 @@
 | 类别 | 覆盖 | 最大缺口 |
 |---|---|---|
 | 各阶段处理时间 | 🟢 **好** | 中间件/filter 链内部不可分 |
-| socket 接口时间 | 🟡 **Envoy 四个边界已对称（2026-08-10）；Go 侧发送仍不对称** | **netpoll 的 writev 边界没拆** —— 这正是"Go 侧写 socket 贵 7–10 倍"查不出原因的地方 |
+| socket 接口时间 | 🟡 **Go 侧收发已拆全；Envoy 发送侧只测到入队** | **Envoy 的 writev 没测** —— `write()` 只入队，真正的 writev 在 onWriteReady 里。所谓"Go 比 Envoy 贵 7–10 倍"是拿入队时间比系统调用时间，**结论已作废** |
 | 排队时间 | 🟡 **本轮从零到部分覆盖** | 内核 accept 队列、TCP 发送缓冲区阻塞、服务端 goroutine 池 |
 | 链路上的时间 | 🔴 **只能得往返，且看不见 socket 以下的一切** | **网卡、驱动、协议栈、softirq 全部不可见** |
 
@@ -89,24 +89,53 @@ read/write 系统调用本身的耗时，以及围绕它的缓冲区管理。
 > 950 与 920B 的差距（3.5 vs 6.3 µs，2.9 倍）是**机器差异**，不是路径差异 ——
 > 见 `test-report.md` §6 的同机对照实验。
 
-### 缺口：发送侧的不对称 ⚠️
+### ~~缺口：发送侧的不对称~~ —— 2026-08-10 拆开了，**顺带推翻了一个结论**
 
-**这是本轮留下的最大技术债。**
+本节原先写着「**Go 侧写 socket 比 Envoy 贵 7–10 倍**（1.8–2.9 µs vs 270–690 ns），
+至今无法归因」。现在 netpoll 的写路径拆开了，结论是：
 
-之前测出一个没解释的现象：**Go 侧写 socket 比 Envoy 贵 7–10 倍**（1.8–2.9 µs vs 270–690 ns）。
-本轮把**接收**侧拆开了，但**发送**侧没有：
+**那个比较从一开始就不成立 —— 两边测的不是同一件事。**
 
-| | 接收 | 发送 |
-|---|---|---|
-| Envoy | `doRead` 前后 ✓ | `write()` 后（只有终点）△ |
-| Go | netpoll `readv` 前后 ✓ | **Flush 前后，里面混着 LinkBuffer 管理 + writev + 可能的 epoll 注册** ✗ |
+`up_encode_done → up_socket_write_done` 括住的是 Envoy 的
+`ConnectionImpl::write()`，而它**只做两件事**：
 
-`mesh_socket_write_start/finish` 括住的是 `bufWriter.Flush()`，而 netpoll 的 Flush 内部要做：
-LinkBuffer 链表整理 → `outputs()` 拼 iovec → `writev` → 写不完则注册 EPOLLOUT 等下次。
-**这四件事混在一起，所以那 7–10 倍差距至今无法归因。**
+```cpp
+write_buffer_->move(data);                                  // 把数据搬进写缓冲区
+ioHandle().activateFileEvents(Event::FileReadyType::Write); // 激活写事件
+```
 
-要拆开需在 netpoll 的 `connection_reactor.go` 的 `outputs`/`outputAck` 与 `sys_exec.go` 的 `writev` 上再加一组点位，
-结构与本轮做的读路径完全对称。**建议下一轮就做**——读路径的框架（`ReadProbe` 槽位、原子快照、`Consistent` 校验）可以直接复用。
+**真正的 writev 发生在 `onWriteReady()` 里，由事件循环稍后调用** ——
+那 260 ns 是「入队 + 激活事件」的耗时，不是系统调用。
+而 Go 侧的 `mesh_socket_write_start/finish` 括住的是同步的 `Flush()`，
+里面**真的**执行了 sendmsg。拿一个入队时间去比一个系统调用时间，
+差 7–10 倍毫不奇怪。
+
+### Go 侧写路径的真实分解（2026-08-10 新增）
+
+| 段 | client(950) | server(920B) |
+|---|---:|---:|
+| LinkBuffer 整理 + 拼 iovec | 99 ns | 152 ns |
+| **★ writev 系统调用** | **1.9 µs (86%)** | **3.2 µs (89%)** |
+| 缓冲区回收 | 57 ns | 92 ns |
+| 合计（写socket） | 2.2 µs | 3.6 µs |
+
+**Go 侧写 socket 的开销几乎全在系统调用本身**，LinkBuffer 管理只占 4~5%。
+此前怀疑的「链表整理 + 拼 iovec + 可能的 epoll 注册混在一起」被证伪：
+小报文一次写完（实测 `writes=1`、`waited=false`，1000/1000），
+根本走不到注册 EPOLLOUT 那条路。
+
+点位：`mesh_np_flush_start` / `mesh_np_writev_start` / `mesh_np_writev_done` /
+`mesh_np_flush_done`，两侧都有。慢路径（部分写）**没有拆开**，
+由 attrs 里的 `waited=true` 标出，分析时按需过滤。
+
+### 现在真正的发送侧缺口：Envoy 的 writev 没测 ⚠️
+
+要跟 Go 侧公平对比，得在 `ConnectionImpl::onWriteReady()` →
+`transport_socket_->doWrite()` 前后加一对点位。结构与 `up_readv_start/done`
+完全对称，读侧已经这么做了。
+
+**在补上之前，任何「Go 写 socket 比 Envoy 慢」的说法都不要再提** ——
+现有数据不支持这个结论，两边量的根本不是一回事。
 
 ### ~~缺口：服务端的 readv 完全没测~~ —— 2026-08-10 已补齐
 
