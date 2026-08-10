@@ -108,6 +108,21 @@ LinkBuffer 链表整理 → `outputs()` 拼 iovec → `writev` → 写不完则�
 要拆开需在 netpoll 的 `connection_reactor.go` 的 `outputs`/`outputAck` 与 `sys_exec.go` 的 `writev` 上再加一组点位，
 结构与本轮做的读路径完全对称。**建议下一轮就做**——读路径的框架（`ReadProbe` 槽位、原子快照、`Consistent` 校验）可以直接复用。
 
+### 缺口：服务端的 readv 完全没测 ⚠️
+
+netpoll 读路径的 5 个点位（`mesh_np_*`）**只插在客户端**：采样判定必须早于阻塞读，
+而服务端此刻还读不到对端 TTHeader 里的 traceparent。
+
+后果是**服务端从 socket 收包的那次 readv 根本没有点位** —— 它发生在 poller
+goroutine 里、`mesh_netpoll_onread` 之前。服务端能看到的最早时刻就是 `OnRead` 入口，
+readv 已经做完了。
+
+**别拿服务端的「取首字节(Peek)」当 readv 读**：那只是从已填好的 LinkBuffer 里
+取前 8 字节，实测 310ns；真正的 readv 在它之前，量级参考客户端的 2.1µs。
+
+补法与 Envoy 下游读同构：用**每连接时间戳槽位**在 poller 里记，等 traceparent
+解出来再决定兑现还是丢弃。Envoy 侧 2026-08-10 已经这么做了，Go 侧可以照搬。
+
 ### ~~缺口：Envoy 下游侧~~ —— 2026-08-10 已补齐
 
 **这一节原来的结论「做不到」是错的**，留在这里作为记录。

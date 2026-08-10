@@ -187,40 +187,73 @@ ConnectionImpl` —— 主动发起的连接天然是派生类,被 accept 的不
 | `mesh_hdr_encode_start/finish` | Encode 的 header 段 | TTHeader 编码耗时;mesh 场景的核心成本项 |
 | `mesh_payload_codec_start/finish` | `encodePayload` 前后 | thrift **序列化**耗时。**只在发送路径上** —— 见下面「payload 只有编码没有解码」 |
 
-### 两个「等待」的关系:先后,不是包含
+### 三个名字骗人的区间(2026-08-10 全部改名)
 
-`★等待对端(纯网络)` 与 `★等待响应体` 容易被当成同一件事,实际是**前后两段**。
+判断一个区间是什么,**要看它在源码里包住了哪段代码**,不能看名字。
+下面三个都因名字被长期误读过。
+
+#### ① `wait_read_*` 不是「等待」,是**反序列化**
+
+`kitex/pkg/remote/codec/thrift/thrift.go`:
+
+```go
+rpcinfo.Record(ctx, ri, stats.WaitReadStart, nil)
+err = c.unmarshalThriftData(ctx, in, data, dataLen)   // ← thrift 反序列化在这里面
+rpcinfo.Record(ctx, ri, stats.WaitReadFinish, err)
+```
+
+包住的是 `unmarshalThriftData`(按需读取缺失字节 + 反序列化)。
+实测 server 550ns / client 400ns,**与编码同量级**(server 500ns / client 320ns),
+正说明它是解码而不是等待。旧名「等待请求体 / 等待响应体」会让人以为开销在等字节。
+
+**推论:接收方向的反序列化一直有点位,只是名字骗人。** 不需要另加。
+
+#### ② 服务端的 `mesh_socket_read_start → mesh_first_byte` 不是「等待对端」
+
+包住的是 `default_codec.go` 的 `in.Peek(2*Size32)`:
+
+- **client 侧**:这次 Peek 真的阻塞等响应,实测 213µs —— 叫「等待对端」没问题
+- **server 侧**:netpoll 的 poller **已经把数据放进 LinkBuffer** 才会触发 `OnRead`,
+  此处 Peek 立即返回,实测 **310ns**。**那里没有任何网络等待**,已改名「取首字节(Peek)」
+
+服务端真正的「等对端」发生在两个请求之间的空闲期,**不属于这条 RPC**,也不该被计入。
+
+> **它也不是 readv 时间。** 服务端的 readv 发生在 poller goroutine 里、
+> `mesh_netpoll_onread` **之前**,而 netpoll 读探针只插在客户端(§2.5:服务端此刻
+> 读不到 TTHeader 里的 traceparent,采样状态不可知)。
+> **所以服务端的 readv 时间目前根本没测** —— 这是现存缺口,记在
+> `probe-coverage-audit.md`。
+
+#### ③ `mesh_payload_codec_*` 只有编码,没有解码
+
+插在 `encodePayload` 前后,**只覆盖发送路径**:
+
+- client 侧实测落在 3.17µs —— 在 `mesh_socket_write_start`(3.59µs) **之前**,是编请求
+- server 侧实测落在 11.13µs —— 在 `server_handle_finish`(9.50µs) **之后**,是编响应
+
+已由「payload解码」改名为「payload编码」。解码那一半由上面 ① 覆盖。
+
+> 早期报告里出现「payload解码」「等待请求体」「等待响应体」字样的,
+> 按本节重新理解。
+
+### client 侧两段的先后关系
+
+`★等待对端(纯网络)` 与 `payload反序列化` 是**前后两段,不是包含关系**。
 1000 条 trace 相对 `rpc_start` 的中位偏移(client 侧):
 
 ```
   5.91µs  mesh_socket_read_start   ┐
 213.69µs  mesh_np_epoll_wake       │ ★等待对端 = 213µs,大头全在这
 219.08µs  mesh_first_byte          ┘
-219.16µs  mesh_hdr_decode_start
 219.91µs  mesh_hdr_decode_finish
-220.41µs  wait_read_start          ┐ ★等待响应体 = 430ns
+220.41µs  wait_read_start          ┐ payload 反序列化 = 430ns
 220.85µs  wait_read_finish         ┘
 222.18µs  read_finish
 ```
 
-**主要等待在 `mesh_first_byte` 就结束了。** `wait_read` 等的是 header 解完之后
-body 的剩余字节 —— 小报文通常在同一次 readv 里就到齐了,所以只有几百纳秒。
-
-两者都被 `read_start → read_finish`(「读取+解码(整段)」)**包含**,
-后者还额外包含 TTHeader 解码。merge 的 detail 用缩进表达这层嵌套。
-
-### payload 只有编码,没有解码
-
-`mesh_payload_codec_*` 插在 `encodePayload` 前后,**只覆盖发送路径**:
-
-- client 侧实测落在 3.17µs —— 在 `mesh_socket_write_start`(3.59µs) **之前**,是编请求
-- server 侧实测落在 11.13µs —— 在 `server_handle_finish`(9.50µs) **之后**,是编响应
-
-**接收方向的 thrift 反序列化目前没有点位,测不到**,它被折叠在
-`read_start → read_finish` 里。要补的话得在 `decodePayload` 前后再加一对。
-
-> merge 的 detail 曾把这一段标成「payload解码」,是错的,2026-08-10 已改为「payload编码」。
-> 早期报告里出现「payload解码」字样的,指的都是编码。
+**等待在 `mesh_first_byte` 就结束了**,后面全是解码。
+两段都被 `read_start → read_finish`(「读取+解码(整段)」)**包含**,
+merge 的 detail 用缩进表达这层嵌套。
 
 ---
 

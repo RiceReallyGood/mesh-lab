@@ -556,11 +556,33 @@ func printBreakdown(traces map[string][]Event) {
 	fmt.Printf("  %s %10s   %5.1f%%\n", padRight("合计", 30), dur(acc), float64(acc)/float64(total)*100)
 	fmt.Printf("  %s %10s\n", padRight("端到端（client 总时长）", 30), dur(total))
 
-	fmt.Printf("\n  **只有 avg 能这么相加，分位数不可加** —— 所以本表只给 avg（§9.3 ①）。\n")
-	fmt.Printf("  「往返」不可拆分单向：跨机是物理限制（需 PTP + 硬件时间戳），\n")
-	fmt.Printf("  同机 UDS 同理 —— 差值法只能得到往返。\n")
-	fmt.Printf("  「往返」也**不是纯线路时间**：内层节点起算点之前的排队（listener/worker 队列）\n")
-	fmt.Printf("  落在测量区间之外，全被算进这一列。低负载无排队时才近似真实传输。\n\n")
+	fmt.Printf("\n── 这两个量到底是什么\n")
+	fmt.Printf("\n")
+	fmt.Printf("  设「N 总」= 节点 N 观测到的最早点到最晚点，\n")
+	fmt.Printf("    「N 等」= 节点 N 花在等下一跳身上的时间，取值为：\n")
+	fmt.Printf("        Envoy 各跳     up_write_done → up_epoll_wake   （请求写出 → 响应把 epoll 唤醒）\n")
+	fmt.Printf("        kitex-client   mesh_socket_read_start → mesh_first_byte\n")
+	fmt.Printf("\n")
+	fmt.Printf("  **「N 自身」= N 总 − N 等**\n")
+	fmt.Printf("      N 真正占用 CPU 的时间：解析、路由、编解码、业务逻辑。\n")
+	fmt.Printf("      **不含**它坐等下一跳的那段。链路末端（server）不等任何人，自身 = 总。\n")
+	fmt.Printf("\n")
+	fmt.Printf("  **「A↔B 往返」= A 等 − B 总**\n")
+	fmt.Printf("      A 在等 B 的那段里，扣掉 B 自己干活的时间，剩下的就是数据在两者之间\n")
+	fmt.Printf("      走了一个来回（去程 + 回程）。两项各自在本机用单调钟测得，\n")
+	fmt.Printf("      相减时时钟偏斜完全抵消 —— 这是跨机也成立的原因（§8.2.3）。\n")
+	fmt.Printf("\n")
+	fmt.Printf("  两式交替套用即可从 client 一路推到 server，各段相加恰好等于端到端\n")
+	fmt.Printf("  （望远镜求和：中间每个「N 总」都被加一次减一次）。\n")
+	fmt.Printf("\n")
+	fmt.Printf("  三条限制：\n")
+	fmt.Printf("  1. **只有 avg 能这么相加，分位数不可加** —— 所以本表只给 avg（§9.3 ①）。\n")
+	fmt.Printf("  2. **「往返」不可拆分单向**：跨机是物理限制（需 PTP + 硬件时间戳网卡）；\n")
+	fmt.Printf("     同机 UDS 同理 —— 差值法给出的本来就是一个来回。\n")
+	fmt.Printf("  3. **「往返」不是纯线路时间**：B 起算点之前的排队（listener/worker 队列、\n")
+	fmt.Printf("     goroutine 调度）落在 B 的测量区间之外，全被这个差值吸收。\n")
+	fmt.Printf("     实测 Envoy worker 从 384 压到 2 时，同机 UDS「往返」从 21µs 涨到 128µs——\n")
+	fmt.Printf("     多出来的一百微秒是排队不是传输。低负载无排队时才近似真实传输时间。\n\n")
 
 	printNodeSpans(traces)
 }
@@ -797,10 +819,21 @@ func envoyPhases(node string) []phase {
 //  2. **父区间与子区间用缩进表达。** 「读取+解码(整段)」是 read_start→read_finish，
 //     它**包含**等待对端、TTHeader 解码、等待响应体三段；平铺在一起会被误读成并列。
 //
-// 关于 mesh_payload_codec_*：它插在 encodePayload 前后，**只在发送路径上**，
-// 所以两侧都叫「payload编码」。曾经标成「payload解码」是错的 ——
-// client 侧实测落在 3.17µs（写 socket 之前），server 侧落在 11.13µs（handler 之后），
-// 都在发送路径。**响应/请求的 payload 解码目前没有点位，测不到。**
+// 两组容易被名字误导的区间，都在 2026-08-10 改过名，理由记在这里：
+//
+//   - mesh_payload_codec_* 插在 encodePayload 前后，**只在发送路径上**，
+//     所以两侧都叫「payload编码」。曾标成「payload解码」是错的 ——
+//     client 侧实测落在 3.17µs（写 socket 之前），server 侧落在 11.13µs
+//     （handler 之后），都在发送路径。
+//
+//   - wait_read_* 包住的是 unmarshalThriftData（见 kitex
+//     pkg/remote/codec/thrift/thrift.go），**那是反序列化，不是等待**。
+//     曾叫「等待请求体 / 等待响应体」，会让人以为主要开销在等字节，
+//     实际是 thrift 解码（server 550ns / client 400ns，与编码同量级）。
+//     所以**接收方向的反序列化一直有点位，只是名字骗人**。
+//
+// 服务端的 mesh_socket_read_start→mesh_first_byte 也**不叫「等待对端」**，
+// 理由见下面 kitexServerPhases 里的注释。
 func kitexClientPhases() []phase {
 	return []phase{
 		{"kitex-client", "取连接", "client_conn_start", "client_conn_finish"},
@@ -819,9 +852,9 @@ func kitexClientPhases() []phase {
 		{"kitex-client", "   │  ├ LinkBuffer入队", "mesh_np_readv_done", "mesh_np_trigger"},
 		{"kitex-client", "   │  └ ★goroutine调度延迟", "mesh_np_trigger", "mesh_first_byte"},
 		{"kitex-client", "   ├ TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
-		// ↓ 与「等待对端」是**先后关系不是包含关系**：等待对端到 mesh_first_byte 就结束了，
-		//   这一段等的是 header 之后 body 的剩余字节，实测仅几百纳秒。
-		{"kitex-client", "   └ ★等待响应体", "wait_read_start", "wait_read_finish"},
+		{"kitex-client", "   ├ 协议层解消息头+校验", "mesh_hdr_decode_finish", "wait_read_start"},
+		{"kitex-client", "   ├ payload反序列化", "wait_read_start", "wait_read_finish"},
+		{"kitex-client", "   └ 缓冲区释放+收尾", "wait_read_finish", "read_finish"},
 
 	}
 }
@@ -831,9 +864,14 @@ func kitexServerPhases() []phase {
 	return []phase{
 		{"kitex-server", "epoll唤醒→开始读", "mesh_netpoll_onread", "mesh_socket_read_start"},
 		{"kitex-server", "读取+解码(整段)", "read_start", "read_finish"},
-		{"kitex-server", "   ├ ★等待对端(纯网络)", "mesh_socket_read_start", "mesh_first_byte"},
+		// ↓ **不叫「等待对端」**：服务端的 OnRead 只在 netpoll 已把数据放进 LinkBuffer
+		//   之后才触发，此处 Peek 立即返回，没有任何网络等待（实测 310ns）。
+		//   服务端真正的「等对端」发生在两个请求之间的空闲期，不属于这条 RPC。
+		{"kitex-server", "   ├ 取首字节(Peek)", "mesh_socket_read_start", "mesh_first_byte"},
 		{"kitex-server", "   ├ TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
-		{"kitex-server", "   └ ★等待请求体", "wait_read_start", "wait_read_finish"},
+		{"kitex-server", "   ├ 协议层解消息头+校验", "mesh_hdr_decode_finish", "wait_read_start"},
+		{"kitex-server", "   ├ payload反序列化", "wait_read_start", "wait_read_finish"},
+		{"kitex-server", "   └ 缓冲区释放+收尾", "wait_read_finish", "read_finish"},
 		{"kitex-server", "业务handler", "server_handle_start", "server_handle_finish"},
 		{"kitex-server", "编码(发送前)", "write_start", "mesh_socket_write_start"},
 		{"kitex-server", "   ├ TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
