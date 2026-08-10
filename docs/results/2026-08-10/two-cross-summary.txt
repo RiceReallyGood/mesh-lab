@@ -1,12 +1,12 @@
 样本数: 1000 条 trace
 
 ── 端到端分解（avg，可相加）
-  kitex-client 自身                  16.3µs     6.2%
-  UDS往返 kitex-client↔envoy-out     20.1µs     7.6%
-  envoy-out 自身                     26.4µs    10.0%
-  跨机往返 envoy-out↔envoy-in       110.6µs    41.8%
-  envoy-in 自身                      44.5µs    16.8%
-  UDS往返 envoy-in↔kitex-server      12.4µs     4.7%
+  kitex-client 自身                  22.4µs     8.5%
+  UDS往返 kitex-client↔envoy-out     14.0µs     5.3%
+  envoy-out 自身                     34.5µs    13.0%
+  跨机往返 envoy-out↔envoy-in       102.6µs    38.8%
+  envoy-in 自身                      50.9µs    19.3%
+  UDS往返 envoy-in↔kitex-server       6.0µs     2.3%
   kitex-server 自身                  34.1µs    12.9%
   ───────────────                  ────────   ─────
   合计                              264.5µs   100.0%

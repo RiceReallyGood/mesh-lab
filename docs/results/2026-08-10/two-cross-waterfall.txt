@@ -119,12 +119,12 @@
 ║ └─
 ║
 ║ ⇄ 本条 trace 的端到端分解（相加 = 端到端）
-║     kitex-client 自身                  13.9µs    3.5%
-║     UDS往返 kitex-client↔envoy-out     19.8µs    5.0%
-║     envoy-out 自身                     20.7µs    5.2%
-║     跨机往返 envoy-out↔envoy-in       240.1µs   60.2%
-║     envoy-in 自身                      39.1µs    9.8%
-║     UDS往返 envoy-in↔kitex-server      12.4µs    3.1%
+║     kitex-client 自身                  20.4µs    5.1%
+║     UDS往返 kitex-client↔envoy-out     13.3µs    3.3%
+║     envoy-out 自身                     25.4µs    6.4%
+║     跨机往返 envoy-out↔envoy-in       235.4µs   59.1%
+║     envoy-in 自身                      46.3µs   11.6%
+║     UDS往返 envoy-in↔kitex-server       5.2µs    1.3%
 ║     kitex-server 自身                  52.5µs   13.2%
 ║     ───────────────                  ────────  ─────
 ║     合计（= client 总时长）           398.6µs
@@ -252,12 +252,12 @@
 ║ └─
 ║
 ║ ⇄ 本条 trace 的端到端分解（相加 = 端到端）
-║     kitex-client 自身                  12.3µs    5.2%
-║     UDS往返 kitex-client↔envoy-out     18.3µs    7.7%
-║     envoy-out 自身                     26.1µs   11.1%
-║     跨机往返 envoy-out↔envoy-in       105.4µs   44.6%
-║     envoy-in 自身                      37.9µs   16.0%
-║     UDS往返 envoy-in↔kitex-server       9.2µs    3.9%
+║     kitex-client 自身                  17.9µs    7.6%
+║     UDS往返 kitex-client↔envoy-out     12.7µs    5.4%
+║     envoy-out 自身                     35.7µs   15.1%
+║     跨机往返 envoy-out↔envoy-in        95.9µs   40.5%
+║     envoy-in 自身                      43.2µs   18.3%
+║     UDS往返 envoy-in↔kitex-server       3.8µs    1.6%
 ║     kitex-server 自身                  27.3µs   11.5%
 ║     ───────────────                  ────────  ─────
 ║     合计（= client 总时长）           236.5µs
@@ -385,12 +385,12 @@
 ║ └─
 ║
 ║ ⇄ 本条 trace 的端到端分解（相加 = 端到端）
-║     kitex-client 自身                  10.3µs    4.7%
-║     UDS往返 kitex-client↔envoy-out     17.8µs    8.1%
-║     envoy-out 自身                     21.6µs    9.8%
-║     跨机往返 envoy-out↔envoy-in        95.4µs   43.3%
-║     envoy-in 自身                      37.1µs   16.8%
-║     UDS往返 envoy-in↔kitex-server       9.8µs    4.4%
+║     kitex-client 自身                  16.1µs    7.3%
+║     UDS往返 kitex-client↔envoy-out     12.0µs    5.4%
+║     envoy-out 自身                     30.4µs   13.8%
+║     跨机往返 envoy-out↔envoy-in        86.6µs   39.3%
+║     envoy-in 自身                      42.6µs   19.3%
+║     UDS往返 envoy-in↔kitex-server       4.3µs    1.9%
 ║     kitex-server 自身                  28.4µs   12.9%
 ║     ───────────────                  ────────  ─────
 ║     合计（= client 总时长）           220.4µs

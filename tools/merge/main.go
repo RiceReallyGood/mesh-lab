@@ -35,9 +35,9 @@ type Event struct {
 // nodeSpan 是某个节点在一次请求中的观测区间。
 // start/end 都用该节点自己的 mono 时钟，因此 duration 是精确的。
 type nodeSpan struct {
-	Host     string
-	Node     string
-	Events   []Event
+	Host      string
+	Node      string
+	Events    []Event
 	StartMono int64
 	EndMono   int64
 	StartWall int64
@@ -449,12 +449,20 @@ func waitOf(s *nodeSpan) (int64, bool) {
 			at[ev.Point] = ev.MonoNs
 		}
 	}
+	// **两侧都取到「epoll 就绪」为止，不含本机把数据取上来的那段。**
+	//
+	// 旧口径是取到「首字节可读」（client）/「等待上游结束」（Envoy），
+	// 那样会把两头各自的本地开销算进「往返」：
+	//   - client 侧混进 poller 派发 + readv + goroutine 调度（实测约 6µs）
+	//   - Envoy 侧混进它自己异步写 socket 的时间（实测约 4.6µs）
+	// 这些都是节点自己的活，算进「往返」会同时高估链路、低估节点自身。
 	var a, b string
 	switch s.Node {
 	case "kitex-client", "kitex-server":
-		a, b = "mesh_socket_read_start", "mesh_first_byte"
+		a, b = "mesh_socket_read_start", "mesh_np_epoll_wake"
 	default: // Envoy 各跳
-		a, b = "up_write_done", "up_epoll_wake"
+		// 起点是 writev 完成而不是 up_write_done —— 请求真正离开本机才算开始等。
+		a, b = "up_writev_done", "up_epoll_wake"
 	}
 	x, oka := at[a]
 	y, okb := at[b]
@@ -753,7 +761,6 @@ func min(a, b int) int {
 	return b
 }
 
-
 // ---------------------------------------------------------------------------
 // detail:逐段命名区间 + 跨节点分层分解
 //
@@ -805,18 +812,24 @@ func envoyPhases(node string) []phase {
 		// + activateFileEvents，真正的 writev 在 onWriteReady() 里由事件循环稍后
 		// 执行 —— 见下面「纯等待」底下那两段。名字里写明，免得再被当成系统调用。
 		{node, "写socket(仅入队)", "up_encode_done", "up_socket_write_done"},
+		// ★等待上游 = 请求写出到响应首字节。按**这段时间里谁在干活**拆成三块，
+		// 而不是按点位顺序平铺 —— 平铺会让父段的名字只描述它第一个子段。
 		{node, "★等待上游", "up_write_done", "up_first_byte"},
-		// ↓ 把「等待上游」拆开。⑤→epoll唤醒 才是真正在等，其余是本进程自己的开销。
-		{node, "   ├ 纯等待(到epoll就绪)", "up_write_done", "up_epoll_wake"},
-		// ↓↓ **「纯等待」的头一段其实根本不是在等** —— Envoy 的写是异步的，
-		//    真正的 writev 由事件循环在 up_write_done **之后**才执行，
-		//    正好落在这个窗口里。实测 envoy-out 1.4µs 调度 + 3.2µs writev，
-		//    也就是说「纯等待」开头那 4.6µs 是它自己在写 socket。
-		{node, "   │  ├ 入队→真正写出", "up_socket_write_done", "up_writev_start"},
+		// ① 本跳自己还在写。Envoy 的写是异步的：write() 只把数据搬进 write_buffer_
+		//    并激活写事件，真正的 writev 由事件循环稍后执行 —— 落在这个窗口开头。
+		//    **这不是等待，是本跳自己的活**，所以提到与「纯等待」平级。
+		{node, "   ├ 异步写出(本跳自己干活)", "up_write_done", "up_writev_done"},
+		{node, "   │  ├ 入队→真正写出", "up_write_done", "up_writev_start"},
 		{node, "   │  └ ★writev系统调用", "up_writev_start", "up_writev_done"},
-		{node, "   ├ ★事件循环排队", "up_epoll_wake", "up_readv_start"},
-		{node, "   ├ readv系统调用", "up_readv_start", "up_readv_done"},
-		{node, "   └ buffer+filter派发", "up_readv_done", "up_first_byte"},
+		// ② 真正的等待：请求已离开本机，对端在处理、数据在路上。
+		//    **起点是 writev_done 不是 up_write_done** —— 用后者的话，
+		//    上面那几微秒自己写 socket 的时间会被算成「等对端」。
+		{node, "   ├ ★纯等待(对端+网络)", "up_writev_done", "up_epoll_wake"},
+		// ③ 数据已就绪，本机把它取上来。
+		{node, "   └ 取数据(epoll就绪→首字节)", "up_epoll_wake", "up_first_byte"},
+		{node, "      ├ ★事件循环排队", "up_epoll_wake", "up_readv_start"},
+		{node, "      ├ readv系统调用", "up_readv_start", "up_readv_done"},
+		{node, "      └ buffer+filter派发", "up_readv_done", "up_first_byte"},
 		{node, "响应解码", "up_first_byte", "resp_decoded"},
 		// ↓ 下游回写：响应离开本跳的 socket 边界。
 		//   注意这里的「写socket(下游)」同样只是入队，而下游的真正 writev
@@ -862,7 +875,7 @@ func kitexClientPhases() []phase {
 		{"kitex-client", "编码(发送前)", "write_start", "mesh_socket_write_start"},
 		{"kitex-client", "   ├ TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
 		{"kitex-client", "   └ payload编码", "mesh_payload_encode_start", "mesh_payload_encode_finish"},
-				{"kitex-client", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
+		{"kitex-client", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
 		// ↓ 把 netpoll 的 Flush 拆开。此前这一整段是个黑盒，
 		//   「Go 侧写 socket 比 Envoy 贵 7–10 倍」只能观察到现象、无法归因。
 		//   waited=true 的样本（走了 EPOLLOUT 慢路径）里最后一段混着等待，
@@ -870,21 +883,27 @@ func kitexClientPhases() []phase {
 		{"kitex-client", "   ├ LinkBuffer整理+拼iovec", "mesh_np_flush_start", "mesh_np_writev_start"},
 		{"kitex-client", "   ├ ★writev系统调用", "mesh_np_writev_start", "mesh_np_writev_done"},
 		{"kitex-client", "   └ 缓冲区回收", "mesh_np_writev_done", "mesh_np_flush_done"},
+		// 与 Envoy 的「等待上游」同一套拆法：按**谁在干活**分三块。
 		{"kitex-client", "读取+解码(整段)", "read_start", "read_finish"},
-		{"kitex-client", "   ├ ★等待对端(纯网络)", "mesh_socket_read_start", "mesh_first_byte"},
-		// ↓ netpoll 内部拆解。只在客户端可用（采样判定必须早于阻塞读，
-		//   服务端此刻还读不到 TTHeader 里的 traceparent，见 probe-points.md §2.5）。
-		//   横跨多轮读的快照在 netpoll 侧已被 Consistent 校验剔除，不会出现在这里。
-		{"kitex-client", "   │  ├ 纯等待(到epoll就绪)", "mesh_socket_read_start", "mesh_np_epoll_wake"},
+		{"kitex-client", "   ├ 进入读到开始阻塞", "read_start", "mesh_socket_read_start"},
+		// ① 真正的等待：请求已发出，对端在处理、数据在路上，到 epoll 就绪为止。
+		//    旧版这段叫「★等待对端(纯网络)」且一直括到 mesh_first_byte，
+		//    **把下面「取数据」那几微秒本地干活也算进了「纯网络」** —— 名不副实。
+		{"kitex-client", "   ├ ★等待对端(到epoll就绪)", "mesh_socket_read_start", "mesh_np_epoll_wake"},
+		// ② 数据已就绪，本机把它取上来交给 RPC goroutine，全是本地开销。
+		//    netpoll 内部拆解只在客户端可用（采样判定必须早于阻塞读，
+		//    服务端此刻读不到 traceparent，见 probe-points.md §2.5）。
+		{"kitex-client", "   ├ 取数据(epoll就绪→首字节)", "mesh_np_epoll_wake", "mesh_first_byte"},
 		{"kitex-client", "   │  ├ ★poller事件排队", "mesh_np_epoll_wake", "mesh_np_dispatch"},
 		{"kitex-client", "   │  ├ readv系统调用", "mesh_np_readv_start", "mesh_np_readv_done"},
 		{"kitex-client", "   │  ├ LinkBuffer入队", "mesh_np_readv_done", "mesh_np_trigger"},
 		{"kitex-client", "   │  └ ★goroutine调度延迟", "mesh_np_trigger", "mesh_first_byte"},
-		{"kitex-client", "   ├ TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
-		{"kitex-client", "   ├ 协议层解消息头+校验", "mesh_hdr_decode_finish", "wait_read_start"},
-		{"kitex-client", "   ├ payload反序列化", "wait_read_start", "wait_read_finish"},
-		{"kitex-client", "   └ 缓冲区释放+收尾", "wait_read_finish", "read_finish"},
-
+		// ③ 数据在手，本 goroutine 解码。
+		{"kitex-client", "   └ 解码(首字节→读完)", "mesh_first_byte", "read_finish"},
+		{"kitex-client", "      ├ TTHeader解码", "mesh_hdr_decode_start", "mesh_hdr_decode_finish"},
+		{"kitex-client", "      ├ 协议层解消息头+校验", "mesh_hdr_decode_finish", "wait_read_start"},
+		{"kitex-client", "      ├ payload反序列化", "wait_read_start", "wait_read_finish"},
+		{"kitex-client", "      └ 缓冲区释放+收尾", "wait_read_finish", "read_finish"},
 	}
 }
 
@@ -914,7 +933,7 @@ func kitexServerPhases() []phase {
 		{"kitex-server", "编码(发送前)", "write_start", "mesh_socket_write_start"},
 		{"kitex-server", "   ├ TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
 		{"kitex-server", "   └ payload编码", "mesh_payload_encode_start", "mesh_payload_encode_finish"},
-				{"kitex-server", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
+		{"kitex-server", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
 		// ↓ 把 netpoll 的 Flush 拆开。此前这一整段是个黑盒，
 		//   「Go 侧写 socket 比 Envoy 贵 7–10 倍」只能观察到现象、无法归因。
 		//   waited=true 的样本（走了 EPOLLOUT 慢路径）里最后一段混着等待，
@@ -1140,9 +1159,9 @@ type netCol struct {
 
 func netCols() []netCol {
 	return []netCol{
-		{"net.client↔envoy-out单程(UDS)", "kitex-client", "★等待对端(纯网络)", "envoy-out"},
-		{"net.envoy-out↔envoy-in单程(跨机)", "envoy-out", "★等待上游", "envoy-in"},
-		{"net.envoy-in↔server单程(UDS)", "envoy-in", "★等待上游", "kitex-server"},
+		{"net.client↔envoy-out单程(UDS)", "kitex-client", "★等待对端(到epoll就绪)", "envoy-out"},
+		{"net.envoy-out↔envoy-in单程(跨机)", "envoy-out", "★纯等待(对端+网络)", "envoy-in"},
+		{"net.envoy-in↔server单程(UDS)", "envoy-in", "★纯等待(对端+网络)", "kitex-server"},
 	}
 }
 
