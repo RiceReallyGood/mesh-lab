@@ -38,8 +38,8 @@ func (s *echoImpl) EchoComplex(ctx context.Context, req *echo.ComplexRequest) (*
 
 func main() {
 	var (
-		addr      = flag.String("addr", "/tmp/kitex-demo/app.sock", "监听地址；含 '/' 视为 UDS，否则视为 TCP")
-		traceFile = flag.String("trace", "/tmp/kitex-demo/trace-server.ndjson", "打点输出文件")
+		addr      = flag.String("addr", probe.RunPath("app.sock"), "监听地址；含 '/' 视为 UDS，否则视为 TCP")
+		traceFile = flag.String("trace", probe.RunPath("trace-server.ndjson"), "打点输出文件")
 		node      = flag.String("node", "kitex-server", "本节点在 trace 中的标识")
 	)
 	flag.Parse()

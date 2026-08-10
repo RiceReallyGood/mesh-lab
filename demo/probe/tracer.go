@@ -116,14 +116,20 @@ func NewTracer(path, node string) (*Tracer, error) {
 // Start 在 RPC 开始时被调用。
 //
 // 大部分点位的采样判定推迟到 Finish —— 那时才能从 rpcinfo 里读到经 TTHeader
-// 传来的 traceparent。唯一的例外是 netpoll 读探针：它必须在阻塞读**之前**打开，
-// 事后无法补采，所以只能在这里判一次。
+// 传来的 traceparent。netpoll 读探针是例外，两侧的开法完全不同：
 //
-// 后果是 netpoll 探针只覆盖**客户端**：客户端的 traceparent 是自己在发起前
-// 塞进 ctx 的，此刻可读；服务端的还在对端发来的 TTHeader 里，此刻读不到。
-// 服务端侧的唤醒时刻由 mesh_netpoll_onread 覆盖（那是 Kitex 层事件，
-// 记在 OnRead 入口，不依赖本槽位）。
+//   - **客户端**：traceparent 是自己发起前塞进 ctx 的，此刻可读，所以在这里
+//     判一次采样再开槽位。探针精确圈在自己那次阻塞读上，未采样零开销。
+//   - **服务端**：OnRead 被回调时读**已经做完了**，没有「读之前」可供开启。
+//     所以探针在连接级常开（Kitex 的 default_server_handler.OnActive），
+//     快照在 OnRead 入口就取好挂进 ctx 了 —— 本函数在服务端什么都不用做。
+//
+// 因此这里要**避免覆盖已有槽位**：服务端走到这里时 ctx 上已经挂着取好的快照，
+// 再 WithNetpollProbe 一次会把它清成空的。
 func (t *Tracer) Start(ctx context.Context) context.Context {
+	if stats.NetpollProbeFrom(ctx) != nil {
+		return ctx // 服务端：OnRead 已挂好快照
+	}
 	if _, sampled := traceContextFrom(ctx); !sampled {
 		return ctx
 	}
@@ -294,8 +300,8 @@ func allEvents() []namedEvent {
 		{stats.MeshFirstByte, "mesh_first_byte"},
 		{stats.MeshHeaderDecodeStart, "mesh_hdr_decode_start"},
 		{stats.MeshHeaderDecodeFinish, "mesh_hdr_decode_finish"},
-		{stats.MeshPayloadCodecStart, "mesh_payload_codec_start"},
-		{stats.MeshPayloadCodecFinish, "mesh_payload_codec_finish"},
+		{stats.MeshPayloadEncodeStart, "mesh_payload_encode_start"},
+		{stats.MeshPayloadEncodeFinish, "mesh_payload_encode_finish"},
 		{stats.MeshHeaderEncodeStart, "mesh_hdr_encode_start"},
 		{stats.MeshHeaderEncodeFinish, "mesh_hdr_encode_finish"},
 		{stats.MeshNetpollOnRead, "mesh_netpoll_onread"},

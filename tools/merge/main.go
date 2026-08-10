@@ -839,7 +839,7 @@ func kitexClientPhases() []phase {
 		{"kitex-client", "取连接", "client_conn_start", "client_conn_finish"},
 		{"kitex-client", "编码(发送前)", "write_start", "mesh_socket_write_start"},
 		{"kitex-client", "   ├ TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
-		{"kitex-client", "   └ payload编码", "mesh_payload_codec_start", "mesh_payload_codec_finish"},
+		{"kitex-client", "   └ payload编码", "mesh_payload_encode_start", "mesh_payload_encode_finish"},
 		{"kitex-client", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
 		{"kitex-client", "读取+解码(整段)", "read_start", "read_finish"},
 		{"kitex-client", "   ├ ★等待对端(纯网络)", "mesh_socket_read_start", "mesh_first_byte"},
@@ -862,7 +862,16 @@ func kitexClientPhases() []phase {
 // kitexServerPhases 与 client 共用上面那套骨架，见 kitexClientPhases 的注释。
 func kitexServerPhases() []phase {
 	return []phase{
-		{"kitex-server", "epoll唤醒→开始读", "mesh_netpoll_onread", "mesh_socket_read_start"},
+		// ↓ netpoll 内部拆解。2026-08-10 起服务端也有了 —— 与客户端的区别只在开关：
+		//   客户端能把探针精确圈在自己那次阻塞读上（发起前 traceparent 已知），
+		//   服务端 OnRead 时读已做完，所以探针在**连接级常开**，OnRead 入口取快照。
+		//   由此白捡一个客户端没有的点：trigger→onread 就是服务端的调度延迟。
+		{"kitex-server", "⓪ netpoll收包(到OnRead)", "mesh_np_epoll_wake", "mesh_netpoll_onread"},
+		{"kitex-server", "   ├ ★poller事件排队", "mesh_np_epoll_wake", "mesh_np_dispatch"},
+		{"kitex-server", "   ├ readv系统调用", "mesh_np_readv_start", "mesh_np_readv_done"},
+		{"kitex-server", "   ├ LinkBuffer入队", "mesh_np_readv_done", "mesh_np_trigger"},
+		{"kitex-server", "   └ ★goroutine调度延迟", "mesh_np_trigger", "mesh_netpoll_onread"},
+		{"kitex-server", "OnRead→开始读", "mesh_netpoll_onread", "mesh_socket_read_start"},
 		{"kitex-server", "读取+解码(整段)", "read_start", "read_finish"},
 		// ↓ **不叫「等待对端」**：服务端的 OnRead 只在 netpoll 已把数据放进 LinkBuffer
 		//   之后才触发，此处 Peek 立即返回，没有任何网络等待（实测 310ns）。
@@ -875,7 +884,7 @@ func kitexServerPhases() []phase {
 		{"kitex-server", "业务handler", "server_handle_start", "server_handle_finish"},
 		{"kitex-server", "编码(发送前)", "write_start", "mesh_socket_write_start"},
 		{"kitex-server", "   ├ TTHeader编码", "mesh_hdr_encode_start", "mesh_hdr_encode_finish"},
-		{"kitex-server", "   └ payload编码", "mesh_payload_codec_start", "mesh_payload_codec_finish"},
+		{"kitex-server", "   └ payload编码", "mesh_payload_encode_start", "mesh_payload_encode_finish"},
 		{"kitex-server", "写socket", "mesh_socket_write_start", "mesh_socket_write_finish"},
 	}
 }

@@ -1,4 +1,4 @@
-# 2026-08-10 下游 socket 点位补齐 —— merge 原始输出
+# 2026-08-10 下游 socket 点位补齐 + 服务端 netpoll 对称 —— merge 原始输出
 
 这些是 `demo/bin/merge` 的**未经加工的输出**，直接 `cat` 即可。
 本轮的改动见 [`../../specs/2026-08-10-downstream-socket-probes-design.md`](../../specs/2026-08-10-downstream-socket-probes-design.md)。
@@ -6,7 +6,9 @@
 ## 本轮做了什么
 
 每跳 Envoy 横跨两条连接（下游 UDS、上游 TCP），四个 socket 边界过去只测了上游那条。
-本轮补上下游读（3 点）与下游写（2 点），**每跳点位数 15 → 20**。
+本轮补上下游读（3 点）与下游写（2 点），**每跳点位数 15 → 20**；
+同时把 netpoll 读路径的 5 个点位从「仅客户端」扩到**服务端也有**，
+两侧终于对称（server 21 → 26）。
 
 最大的收益不在这五段本身：`dn_first_byte` 记在 filter 的 `onData` 入口，
 已经在 socket 读、buffer append、filter 派发**之后** —— 那一整段过去被
@@ -25,7 +27,7 @@ two   client(950) ─UDS─▶ envoy-out(950) ──TCP:15006──▶ envoy-in(
 | payload | 128 B |
 | 采样率 | **1.0**（验证轮，要每条都有） |
 | `ENVOY_CONCURRENCY` | 2 |
-| 端到端 p50 | 229 µs |
+| 端到端 p50 | 240 µs |
 
 ## 数据完整性
 
@@ -38,15 +40,17 @@ two   client(950) ─UDS─▶ envoy-out(950) ──TCP:15006──▶ envoy-in(
 [probe] node=kitex-server 总请求=1000 采样=1000 丢弃=0
 ```
 
-逐条核对：client 1000×25、envoy-out 1000×20、envoy-in 1000×20、server 1000×21 点位，
-共 86000 个事件，一条不缺。**判据是「记录==落盘 且 丢弃=0」，不是数行数。**
+逐条核对：client 1000×25、envoy-out 1000×20、envoy-in 1000×20、**server 1000×26** 点位，
+共 91000 个事件，一条不缺。**判据是「记录==落盘 且 丢弃=0」，不是数行数。**
+
+服务端从 21 → 26 是因为补上了 netpoll 读路径 5 点（见下）。
 
 ## 文件
 
 | 文件 | 内容 |
 |---|---|
 | `two-cross-summary.txt` | **端到端分解**：各节点自身 + 各段往返，相加等于 100%（下面有表） |
-| `two-cross-detail.txt` | **主力**：各阶段分位数，含本轮新增的五段 |
+| `two-cross-detail.txt` | **主力**：各阶段分位数。节点按请求流向排，节点内按真实时序排，父子用缩进 |
 | `two-cross-table-sample.csv` | 逐条 CSV 的前 25 条（前四行是全量聚合，不受 limit 影响） |
 | `two-cross-waterfall.txt` | 3 条个案，**按物理机分块、同机节点交错成一条时间线** |
 
@@ -59,14 +63,14 @@ two   client(950) ─UDS─▶ envoy-out(950) ──TCP:15006──▶ envoy-in(
 
 | 段 | avg | 占比 |
 |---|---:|---:|
-| kitex-client 自身 | 13.9 µs | 5.3% |
-| UDS 往返 client↔envoy-out | 19.3 µs | 7.3% |
-| envoy-out 自身 | 24.5 µs | 9.3% |
-| **跨机往返 envoy-out↔envoy-in** | **108.4 µs** | **41.1%** |
-| envoy-in 自身 | 43.9 µs | 16.6% |
-| UDS 往返 envoy-in↔server | 34.7 µs | 13.1% |
-| kitex-server 自身 | 19.2 µs | 7.3% |
-| 合计 | 263.9 µs | 100.0% |
+| kitex-client 自身 | 16.7 µs | 6.5% |
+| UDS 往返 client↔envoy-out | 20.9 µs | 8.2% |
+| envoy-out 自身 | 25.9 µs | 10.1% |
+| **跨机往返 envoy-out↔envoy-in** | **100.6 µs** | **39.4%** |
+| envoy-in 自身 | 43.1 µs | 16.9% |
+| UDS 往返 envoy-in↔server | 13.6 µs | 5.3% |
+| kitex-server 自身 | 34.5 µs | 13.5% |
+| 合计 | 255.3 µs | 100.0% |
 
 推导只用两个式子交替套用：**节点总时长 − 它等下一跳的时间 = 节点自身处理**，
 **它等下一跳的时间 − 下一跳的总时长 = 两者之间的往返**。望远镜求和，误差恒为 0。
@@ -79,6 +83,28 @@ two   client(950) ─UDS─▶ envoy-out(950) ──TCP:15006──▶ envoy-in(
 
 旧的「各节点观测区间」保留在 summary 下半部分 —— 那些数是差值法的原始输入，
 也是既有报告引用的口径，但它们**嵌套且不可相加**。
+
+## 服务端 netpoll 补齐带来的归因转移
+
+服务端此前最早只能看到 `mesh_netpoll_onread`（OnRead 入口），
+epoll 唤醒→readv→LinkBuffer→调度这一整段不可见，被算进了 UDS 往返里。
+补上 5 个点位后：
+
+| 段 | avg |
+|---|---:|
+| ⓪ netpoll 收包（到 OnRead） | **14.8 µs** |
+| 　├ poller 事件排队 | 451 ns |
+| 　├ **readv 系统调用** | **6.0 µs** |
+| 　├ LinkBuffer 入队 | 145 ns |
+| 　└ **goroutine 调度延迟** | **7.8 µs** |
+
+于是 `UDS 往返 envoy-in↔server` 从 34.7 µs 降到 **13.6 µs**，
+`kitex-server 自身` 从 19.2 µs 升到 **34.5 µs** ——
+约 15 µs 从「不可解释的往返」挪进了服务端自己的收包路径。
+
+**开销**：服务端探针只能连接级常开，所以专门测了一轮（`KITEX_PROBE_NETPOLL_SERVER`
+0/1 交错 3 轮、`-sample 0`）：均值 241.3 vs 239.0 µs，**开着比关着还「快」1.0%**，
+差异全在噪声内。
 
 ## 归因闭合
 

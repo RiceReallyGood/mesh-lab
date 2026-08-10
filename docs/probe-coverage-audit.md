@@ -79,7 +79,7 @@ read/write 系统调用本身的耗时，以及围绕它的缓冲区管理。
 |---|---|---|
 | Envoy 上游**接收** | `up_readv_start` → `up_readv_done` | **3.5 / 6.3 µs** |
 | Envoy 上游**发送** | `up_encode_done` → `up_socket_write_done` | 290 / 710 ns |
-| netpoll **接收** | `mesh_np_readv_start` → `mesh_np_readv_done` | **2.5 µs**（仅客户端侧） |
+| netpoll **接收** | `mesh_np_readv_start` → `mesh_np_readv_done` | **2.5 µs**（2026-08-10 起服务端也有，实测 7.7 µs）|
 | Kitex **发送** | `mesh_socket_write_start` → `mesh_socket_write_finish` | 1.8 / 5.7 µs |
 
 > **接收比发送贵一个数量级**（Envoy 3.5 µs vs 290 ns）。`doRead` 内部是循环，
@@ -108,20 +108,35 @@ LinkBuffer 链表整理 → `outputs()` 拼 iovec → `writev` → 写不完则�
 要拆开需在 netpoll 的 `connection_reactor.go` 的 `outputs`/`outputAck` 与 `sys_exec.go` 的 `writev` 上再加一组点位，
 结构与本轮做的读路径完全对称。**建议下一轮就做**——读路径的框架（`ReadProbe` 槽位、原子快照、`Consistent` 校验）可以直接复用。
 
-### 缺口：服务端的 readv 完全没测 ⚠️
+### ~~缺口：服务端的 readv 完全没测~~ —— 2026-08-10 已补齐
 
-netpoll 读路径的 5 个点位（`mesh_np_*`）**只插在客户端**：采样判定必须早于阻塞读，
-而服务端此刻还读不到对端 TTHeader 里的 traceparent。
+原文说 netpoll 读路径的 5 个点位「只插在客户端」，因为采样判定必须早于阻塞读，
+而服务端此刻读不到 traceparent。**前提对，结论错** —— 和下面 Envoy 下游读那条
+犯的是同一个错：采样未知只否定了「按 RPC 开关探针」这一种做法，不否定打点本身。
 
-后果是**服务端从 socket 收包的那次 readv 根本没有点位** —— 它发生在 poller
-goroutine 里、`mesh_netpoll_onread` 之前。服务端能看到的最早时刻就是 `OnRead` 入口，
-readv 已经做完了。
+服务端改为**连接级常开**（`default_server_handler.OnActive`）、
+**`OnRead` 入口取快照**（那时读早已完成，槽位是完整的一轮），
+采样与否留到 `Tracer.Finish` 再判。开销由 `KITEX_PROBE_NETPOLL_SERVER=0` 可关。
 
-**别拿服务端的「取首字节(Peek)」当 readv 读**：那只是从已填好的 LinkBuffer 里
-取前 8 字节，实测 310ns；真正的 readv 在它之前，量级参考客户端的 2.1µs。
+补上之后服务端多出 **18.0 µs** 此前完全不可见的时间（avg，跨机双跳 c=1）：
 
-补法与 Envoy 下游读同构：用**每连接时间戳槽位**在 poller 里记，等 traceparent
-解出来再决定兑现还是丢弃。Envoy 侧 2026-08-10 已经这么做了，Go 侧可以照搬。
+| 段 | 服务端(920B) | 客户端(950) |
+|---|---:|---:|
+| poller 事件排队 | 453 ns | 198 ns |
+| **readv 系统调用** | **7.7 µs** | 2.6 µs |
+| LinkBuffer 入队 | 158 ns | 97 ns |
+| **goroutine 调度延迟** | **9.1 µs** | 3.2 µs |
+| 合计 | **18.0 µs** | 6.1 µs |
+
+服务端每项都贵 2~3 倍，与 `test-report.md` §6 记的机器差异一致，不是路径差异。
+
+**归因收益**：端到端分解里 `UDS往返 envoy-in↔kitex-server` 从 34.7 µs 降到
+**18.9 µs**，`kitex-server 自身` 从 19.2 µs 升到 **39.9 µs** ——
+约 16 µs 从「不可解释的 UDS 往返」挪进了服务端自己的收包路径。
+
+> 补的过程中发现 `mesh_np_trigger` 在服务端**根本没被记过**：`inputAck` 里
+> 服务端走 `onRequest()` 分支并直接返回，压根到不了记 trigger 的地方，
+> 于是五点校验必然判为不一致，1000 条只有 1 条通过。详见 `probe-points.md` §二·五。
 
 ### ~~缺口：Envoy 下游侧~~ —— 2026-08-10 已补齐
 
@@ -158,7 +173,7 @@ store，零分配，`bindTrace` 时再决定兑现还是丢弃（机制见 `prob
 |---|---|---|
 | **Envoy 事件循环内** | `up_epoll_wake` → `up_readv_start` | c=1 时 130 ns；**c=16 时 p90 15.5 µs / p99 41.5 µs**。**这一刀区分「Envoy 处理慢」和「Envoy 排不过来」** |
 | **netpoll 同批 epoll 事件内** | `mesh_np_epoll_wake` → `mesh_np_dispatch` | 190 ns ~ 1.1 µs，Go 侧的对应物 |
-| **goroutine 调度延迟** | `mesh_np_trigger` → `mesh_first_byte` | **跨机 TCP 11.4 µs / 本机 UDS 2.8 µs（4.1 倍）**。数据已进 LinkBuffer 但 RPC goroutine 还没被调度起来 |
+| **goroutine 调度延迟** | `mesh_np_trigger` → `mesh_first_byte`（client）<br>`mesh_np_trigger` → `mesh_netpoll_onread`（server） | **跨机 TCP 11.4 µs / 本机 UDS 2.8 µs（4.1 倍）**。数据已进 LinkBuffer 但 RPC goroutine 还没被调度起来。2026-08-10 起服务端也有，实测 9.1 µs |
 
 这三项是本轮最有价值的产出——它们是"负载升高时时延为什么变差"的直接答案，而此前只能看到总时延变大。
 
@@ -183,7 +198,6 @@ store，零分配，`bindTrace` 时再决定兑现还是丢弃（机制见 `prob
 |---|---|---|
 | **内核 accept 队列 / SYN backlog** | 新连接在内核队列里等多久完全不可见。连接风暴时这是主因 | 需 eBPF 或 `ss -lti` 采样 |
 | **TCP 发送缓冲区阻塞** | 对端慢时 write 部分写或阻塞，现在会被算成"编码慢" | 记录 `write()` 返回值与请求长度之差即可，成本低 |
-| **服务端 goroutine 池排队** | Kitex server 侧 `OnRead` → handler 之间的调度。客户端侧已有 `mesh_np_trigger`，服务端侧没有对应物 | 中等，`mesh_netpoll_onread` 已是半个 |
 | **连接池等待时长** | 现在只有 `up_conn_new`/`up_conn_reused` 二元标志。`route_resolved → up_conn_*` 勉强可算，但混着 DNS/健康检查 | 低，可加显式点位 |
 | **Envoy worker 线程负载不均** | 某个 worker 过载时，其上所有连接一起变慢，但归因会指向"Envoy 处理慢" | 打点时记录 worker/thread id 即可 |
 

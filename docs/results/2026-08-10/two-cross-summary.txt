@@ -1,16 +1,16 @@
 样本数: 1000 条 trace
 
 ── 端到端分解（avg，可相加）
-  kitex-client 自身                  13.9µs     5.3%
-  UDS往返 kitex-client↔envoy-out     19.3µs     7.3%
-  envoy-out 自身                     24.5µs     9.3%
-  跨机往返 envoy-out↔envoy-in       108.4µs    41.1%
-  envoy-in 自身                      43.9µs    16.6%
-  UDS往返 envoy-in↔kitex-server      34.7µs    13.1%
-  kitex-server 自身                  19.2µs     7.3%
+  kitex-client 自身                  16.7µs     6.5%
+  UDS往返 kitex-client↔envoy-out     20.9µs     8.2%
+  envoy-out 自身                     25.9µs    10.1%
+  跨机往返 envoy-out↔envoy-in       100.6µs    39.4%
+  envoy-in 自身                      43.1µs    16.9%
+  UDS往返 envoy-in↔kitex-server      13.6µs     5.3%
+  kitex-server 自身                  34.5µs    13.5%
   ───────────────                  ────────   ─────
-  合计                              263.9µs   100.0%
-  端到端（client 总时长）           263.9µs
+  合计                              255.3µs   100.0%
+  端到端（client 总时长）           255.3µs
 
 ── 这两个量到底是什么
 
@@ -42,10 +42,10 @@
 
 ── 各节点观测区间（**嵌套，不可相加**，差值法的原始输入）
 区间                          avg        p50        p90        p99        max
-链路开销(往返)                244.7µs    204.7µs    372.6µs    528.8µs    3.710ms
-envoy-in                 97.7µs     89.9µs     97.9µs    239.2µs    1.062ms
-envoy-out               230.7µs    195.1µs    360.6µs    485.4µs    1.776ms
-kitex-client            263.9µs    223.4µs    390.3µs    551.6µs    3.869ms
-kitex-server             19.2µs     18.3µs     22.9µs     32.6µs    159.6µs
+链路开销(往返)                220.8µs    200.6µs    213.1µs    479.3µs    3.881ms
+envoy-in                 91.2µs     84.7µs     92.5µs    231.6µs    1.853ms
+envoy-out               217.7µs    204.4µs    215.2µs    475.7µs    2.760ms
+kitex-client            255.3µs    233.9µs    248.3µs    511.9µs    5.214ms
+kitex-server             34.5µs     32.2µs     37.9µs     49.6µs    1.333ms
 
 注：涉及跨机，「链路开销」为往返总和，不可拆分单向（§8.2.4）

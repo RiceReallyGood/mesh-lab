@@ -48,9 +48,25 @@ CONC_FLAG=""
 [ -n "$ENVOY_CONCURRENCY" ] && CONC_FLAG="--concurrency $ENVOY_CONCURRENCY"
 DEMO="$LOCAL_ROOT/mesh-lab/demo"
 CONF="$LOCAL_ROOT/mesh-lab/envoy-conf"
-RUN=/tmp/kitex-demo
 
-PEER_RUN=/tmp/kitex-demo
+# 运行目录**按用户隔离**。
+#
+# 曾经两台机器都写死 /tmp/kitex-demo —— 这两台是共享开发机，2026-08-10 就撞上了：
+# 另一个用户在同一时间跑同一套实验，两边的 /tmp/kitex-demo 全变成他的文件，
+# 我方进程写不进去（sticky 位挡着），而 collect 照样把**对方的** 588MB trace
+# 拉了回来。数据看着是「有」的，只是不是自己的 —— 这种污染没有任何报错。
+#
+# 用 id -un 而不是 $USER：后者在非交互 ssh 下可能为空。
+RUN=${MESHLAB_RUN:-/tmp/kitex-demo-$(id -un)}
+PEER_RUN=${MESHLAB_PEER_RUN:-/tmp/kitex-demo-$(id -un)}
+
+# Envoy 的 bootstrap 里 UDS 路径是写死的，且 Envoy 不做环境变量替换，
+# 所以每轮把配置按本轮的运行目录生成一份临时副本。
+GEN_CONF="$RUN/conf"
+gen_conf() {   # $1=源文件名 $2=目标路径前缀里用的运行目录
+  mkdir -p "$GEN_CONF"
+  sed "s#/tmp/kitex-demo#$2#g" "$CONF/$1" > "$GEN_CONF/$1"
+}
 # direct/single 下 server 直接对外提供 TCP；two 下它躲在 envoy-in 后面走 UDS。
 #
 # 端口刻意与 two 的 envoy-in 用同一个 15006，两个理由：
@@ -101,7 +117,8 @@ sync_peer() {
   # 但 direct/single 根本不需要它，没必要每轮都比对。
   if [ "$TOPO" = "two" ]; then
     rsync -a "$ENVOY" "$PEER:~/meshlab/bin/envoy-static"
-    rsync -a "$CONF/two-hop-in-remote.yaml" "$PEER:~/meshlab/conf/"
+    gen_conf two-hop-in-remote.yaml "$PEER_RUN"
+    rsync -a "$GEN_CONF/two-hop-in-remote.yaml" "$PEER:~/meshlab/conf/"
   fi
 }
 
@@ -147,16 +164,18 @@ start() {
       ;;
     single)
       echo "[本机] 启动 envoy-out（single-hop-remote，base-id=$BASE_SINGLE）"
+      gen_conf single-hop-remote.yaml "$RUN"
       tmux new-session -d -s "$SESSION"
       tmux new-window -t "$SESSION" -n envoy-out \
-        "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $CONF/single-hop-remote.yaml --base-id $BASE_SINGLE $CONC_FLAG --log-level info 2>&1 | tee $RUN/envoy-out.log"
+        "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $GEN_CONF/single-hop-remote.yaml --base-id $BASE_SINGLE $CONC_FLAG --log-level info 2>&1 | tee $RUN/envoy-out.log"
       sleep 3
       ;;
     two)
       echo "[本机] 启动 envoy-out（two-hop-out-remote，base-id=$BASE_OUT）"
+      gen_conf two-hop-out-remote.yaml "$RUN"
       tmux new-session -d -s "$SESSION"
       tmux new-window -t "$SESSION" -n envoy-out \
-        "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $CONF/two-hop-out-remote.yaml --base-id $BASE_OUT $CONC_FLAG --log-level info 2>&1 | tee $RUN/envoy-out.log"
+        "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $GEN_CONF/two-hop-out-remote.yaml --base-id $BASE_OUT $CONC_FLAG --log-level info 2>&1 | tee $RUN/envoy-out.log"
       sleep 3
       ;;
   esac

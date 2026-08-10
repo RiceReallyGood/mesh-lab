@@ -32,14 +32,14 @@ import (
 
 func main() {
 	var (
-		target     = flag.String("target", "/tmp/kitex-demo/out.sock", "sidecar 地址（UDS 路径或 host:port）")
+		target     = flag.String("target", probe.RunPath("out.sock"), "sidecar 地址（UDS 路径或 host:port）")
 		service    = flag.String("service", "echo-server", "真实目标服务名，写入 TTHeader ToService 供 Envoy 路由")
 		concurrent = flag.Int("c", 1, "并发数")
 		duration   = flag.Duration("d", 5*time.Second, "压测时长；为 0 时只发 -n 个请求")
 		total      = flag.Int("n", 1, "-d 为 0 时发送的请求总数")
 		payload    = flag.Int("size", 128, "payload 字节数")
 		sampleRate = flag.Float64("sample", 1.0, "采样率 0~1；压测时调低（§8.4.3）")
-		traceFile  = flag.String("trace", "/tmp/kitex-demo/trace-client.ndjson", "打点输出文件")
+		traceFile  = flag.String("trace", probe.RunPath("trace-client.ndjson"), "打点输出文件")
 		node       = flag.String("node", "kitex-client", "本节点在 trace 中的标识")
 	)
 	flag.Parse()

@@ -202,6 +202,8 @@ ENVOY_CONCURRENCY=2 ./scripts/run-cross-machine.sh start
 | 变量 | 谁需要 | 说明 |
 |---|---|---|
 | `KITEX_PROBE_HOST` | 全部进程 | **两台机器必须不同**。默认取 hostname，而本环境两台都是 `localhost.localdomain`，一样的话跨机会被静默误判成同机，差值法的前提就没了 |
+| `MESHLAB_RUN` / `MESHLAB_PEER_RUN` | 脚本与 demo | 运行目录，默认 `/tmp/kitex-demo-$(id -un)`，**按用户隔离**。2026-08-10 之前写死 `/tmp/kitex-demo`，而这两台是共享开发机 —— 撞过一次：另一用户同时跑同一套实验，两边目录全变成他的文件，我方写不进去，而 `collect` 照样把**对方的** trace 拉了回来，没有任何报错 |
+| `KITEX_PROBE_NETPOLL_SERVER` | kitex-server | 服务端 netpoll 读探针，默认开。它只能**连接级常开**（`OnRead` 时读已做完，来不及按 RPC 开关），所以持续占着 poller 热路径一点开销。设 `0` 关掉，用于 §8.6 的干净基线 |
 | `KITEX_PROBE_PATH` | Envoy | 打点输出路径。**不设则完全不落盘且不报错** |
 | `KITEX_PROBE_NODE` | Envoy | 节点名，如 `envoy-out` / `envoy-in` |
 

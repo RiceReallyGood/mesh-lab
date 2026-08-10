@@ -257,7 +257,7 @@ merge 的 detail 用缩进表达这层嵌套。
 
 ---
 
-## 二·五、netpoll 内部(5 个点,仅客户端侧)
+## 二·五、netpoll 内部(5 个点,**两侧都有**)
 
 Kitex 客户端阻塞在 `Peek` 上等响应,这一段占端到端 95% 以上,但它是个黑盒:
 里面混着「对端真没回」「回了但 epoll 没轮到」「读完了但 goroutine 没被调度」三件事,
@@ -272,7 +272,21 @@ Kitex 客户端阻塞在 `Peek` 上等响应,这一段占端到端 95% 以上,�
 | `mesh_np_epoll_wake` | `poll_default_linux.go` `EpollWait` 返回后 | epoll 唤醒 |
 | `mesh_np_dispatch` | `handler()` 里轮到本连接时 | **同批事件里排在前面的连接占用的时间** |
 | `mesh_np_readv_start` / `_done` | `ioread()` 前后 | readv 系统调用(单次,不像 Envoy 是循环) |
-| `mesh_np_trigger` | `inputAck` 里 `triggerRead` 之前 | 数据已进 LinkBuffer,即将唤醒等待方 |
+| `mesh_np_trigger` | `inputAck` 里交接给等待方之前 | 数据已进 LinkBuffer,即将交接 |
+
+**`mesh_np_trigger` 在两侧记在不同分支**,这是 2026-08-10 补服务端时踩的坑。
+`inputAck` 的结构是:
+
+```go
+needTrigger := true
+if length == n { needTrigger = c.onRequest() }   // 服务端在这里就把请求派发出去了
+if needTrigger && ... { markTrigger(); c.triggerRead(nil) }   // 客户端走这条
+```
+
+服务端装了 `onRequest` 回调,交接发生在 `onRequest()` **内部**,处理成功后它返回
+`false`,下面整块跳过 —— 只在下面记的话**服务端的 trigger 恒为 0**,
+五点校验必然判为不一致。实测 1000 条只有 1 条通过。现已在两条分支各记一次
+(用局部标志防止都命中时把 `rounds` 多加一遍)。
 
 由此得到的关键量:
 
@@ -281,7 +295,22 @@ Kitex 客户端阻塞在 `Peek` 上等响应,这一段占端到端 95% 以上,�
 | `mesh_socket_read_start` → `mesh_np_epoll_wake` | **纯等待** |
 | `mesh_np_epoll_wake` → `mesh_np_dispatch` | poller 事件循环内排队 |
 | `mesh_np_readv_start` → `_done` | socket 收包 |
-| **`mesh_np_trigger` → `mesh_first_byte`** | ★ **goroutine 调度延迟**。整套插桩里唯一能量出「数据到了但没被调度起来」的地方 |
+| **`mesh_np_trigger` → `mesh_first_byte`**(client)<br>**`mesh_np_trigger` → `mesh_netpoll_onread`**(server) | ★ **goroutine 调度延迟**。整套插桩里唯一能量出「数据到了但没被调度起来」的地方。服务端取 `mesh_netpoll_onread` 是因为那才是它用户态的第一个时刻 |
+
+### 两侧的开关方式完全不同
+
+|  | 客户端 | 服务端 |
+|---|---|---|
+| 采样何时可知 | `Tracer.Start` 时就知道(traceparent 是自己生成的) | **读发生时不可知**,traceparent 还在没解析的字节流里 |
+| 探针开关粒度 | **每次 RPC**:读之前开、读之后关(`default_client_handler`) | **每条连接常开**(`default_server_handler.OnActive`) |
+| 何时取快照 | 阻塞读返回后的 defer | **`OnRead` 入口** —— 那时读早已完成,槽位是完整的一轮 |
+| 未采样开销 | 零(压根不开) | poller 每次 epoll 唤醒一次 `time.Now`,每次读几次原子写 |
+
+服务端做不到「按 RPC 开关」的根本原因是**时序**:`OnRead` 被回调时读**已经做完了**,
+那一刻 RPC 还不存在,根本没有「读之前」可供开启。所以只能连接级常开、事后取。
+
+因为常开有持续开销,留了开关:`KITEX_PROBE_NETPOLL_SERVER=0` 可关掉服务端这一侧,
+让 §8.6 的对照组仍能拿到干净基线。默认开。
 
 ### 两个必须知道的限制
 
