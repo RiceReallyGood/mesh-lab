@@ -41,6 +41,10 @@
 > 补齐后四个边界对称：`dn_readv_*` / `up_encode_done`+`up_socket_write_done` /
 > `up_readv_*` / `dn_encode_done`+`dn_socket_write_done`。
 
+> **①–⑧ 是点位的权威编号，本文是它的出处。** merge 的 detail 输出
+> 2026-08-10 起不再把编号印在行首 —— 四个节点里只有 Envoy 有这套编号，
+> 混排反而难读，改用统一的树形缩进表达包含关系。查编号对应关系看本表。
+
 | # | 点位 | 代码位置 | 含义 | 去掉它就算不出什么 |
 |---|---|---|---|---|
 | ① | `dn_first_byte` | `conn_manager.cc` `onData` 入口 | 下游字节到达 Envoy 的最早时刻 | **"数据到达"到"开始解析"的间隔**;这是唯一早于 TTHeader 解析的点,也是与上一跳衔接的锚点 |

@@ -792,33 +792,38 @@ func envoyPhases(node string) []phase {
 		//   补这三段之前，本跳最早的点是 dn_first_byte，而它已经在 socket 读、
 		//   buffer append、filter chain 派发**之后** —— 于是这一整段被算进了
 		//   **上一跳的「纯等待」**里。上一跳那段占端到端 79%，却因此从未被分解过。
-		{node, "⓪ 下游收包(到dn_first_byte)", "dn_epoll_wake", "dn_first_byte"},
+		{node, "下游收包(到dn_first_byte)", "dn_epoll_wake", "dn_first_byte"},
 		{node, "   ├ ★下游事件循环排队", "dn_epoll_wake", "dn_readv_start"},
 		{node, "   ├ 下游readv系统调用", "dn_readv_start", "dn_readv_done"},
 		{node, "   └ 下游buffer+filter派发", "dn_readv_done", "dn_first_byte"},
-		{node, "①→② TTHeader解析", "dn_first_byte", "hdr_decoded"},
-		{node, "②→③ 协议层解头", "hdr_decoded", "msg_begin"},
-		{node, "③→④ 路由匹配", "msg_begin", "route_resolved"},
-		{node, "④→ 取上游连接", "route_resolved", "up_conn_reused"},
-		{node, "  编码", "up_conn_reused", "up_encode_done"},
-		// **「写socket」只是入队**：ConnectionImpl::write() 做的是
-		// write_buffer_->move(data) + activateFileEvents，真正的 writev 在
-		// onWriteReady() 里由事件循环稍后执行。名字里写明，免得再被当成系统调用。
-		{node, "  写socket(仅入队)", "up_encode_done", "up_socket_write_done"},
-		{node, "  ↳ 入队→真正写出", "up_socket_write_done", "up_writev_start"},
-		{node, "  ↳ ★writev系统调用", "up_writev_start", "up_writev_done"},
-		{node, "⑤→⑥ ★等待上游", "up_write_done", "up_first_byte"},
-		// ↓ 把上面那段「等待上游」拆开。⑤→epoll唤醒 才是真正在等，
-		//   其余三段是本进程自己的开销，此前全被算作等待。
+		{node, "TTHeader解析", "dn_first_byte", "hdr_decoded"},
+		{node, "协议层解消息头", "hdr_decoded", "msg_begin"},
+		{node, "路由匹配", "msg_begin", "route_resolved"},
+		{node, "取上游连接", "route_resolved", "up_conn_reused"},
+		{node, "帧编码", "up_conn_reused", "up_encode_done"},
+		// **只是入队**：ConnectionImpl::write() 做的是 write_buffer_->move(data)
+		// + activateFileEvents，真正的 writev 在 onWriteReady() 里由事件循环稍后
+		// 执行 —— 见下面「纯等待」底下那两段。名字里写明，免得再被当成系统调用。
+		{node, "写socket(仅入队)", "up_encode_done", "up_socket_write_done"},
+		{node, "★等待上游", "up_write_done", "up_first_byte"},
+		// ↓ 把「等待上游」拆开。⑤→epoll唤醒 才是真正在等，其余是本进程自己的开销。
 		{node, "   ├ 纯等待(到epoll就绪)", "up_write_done", "up_epoll_wake"},
+		// ↓↓ **「纯等待」的头一段其实根本不是在等** —— Envoy 的写是异步的，
+		//    真正的 writev 由事件循环在 up_write_done **之后**才执行，
+		//    正好落在这个窗口里。实测 envoy-out 1.4µs 调度 + 3.2µs writev，
+		//    也就是说「纯等待」开头那 4.6µs 是它自己在写 socket。
+		{node, "   │  ├ 入队→真正写出", "up_socket_write_done", "up_writev_start"},
+		{node, "   │  └ ★writev系统调用", "up_writev_start", "up_writev_done"},
 		{node, "   ├ ★事件循环排队", "up_epoll_wake", "up_readv_start"},
 		{node, "   ├ readv系统调用", "up_readv_start", "up_readv_done"},
 		{node, "   └ buffer+filter派发", "up_readv_done", "up_first_byte"},
-		{node, "⑥→⑦ 响应解码", "up_first_byte", "resp_decoded"},
-		// ↓ 下游回写：响应离开本跳的 socket 边界。与上游侧的「编码/写socket」对称。
-		{node, "⑦→⑧ 下游回写", "resp_decoded", "dn_socket_write_done"},
+		{node, "响应解码", "up_first_byte", "resp_decoded"},
+		// ↓ 下游回写：响应离开本跳的 socket 边界。
+		//   注意这里的「写socket(下游)」同样只是入队，而下游的真正 writev
+		//   采不到 —— 执行时 rpc_done 已经释放了绑定，见 probe-coverage-audit.md。
+		{node, "下游回写", "resp_decoded", "dn_socket_write_done"},
 		{node, "   ├ 响应编码", "resp_decoded", "dn_encode_done"},
-		{node, "   └ 写socket(下游)", "dn_encode_done", "dn_socket_write_done"},
+		{node, "   └ 写socket(下游,仅入队)", "dn_encode_done", "dn_socket_write_done"},
 	}
 }
 
@@ -1018,7 +1023,11 @@ func printDetail(traces map[string][]Event) {
 		}
 	}
 
-	fmt.Printf("样本数: %d 条 trace\n\n", len(traces))
+	fmt.Printf("样本数: %d 条 trace\n", len(traces))
+	// 四个节点用同一套缩进约定，读者不必在脑子里换算：
+	// 顶层无前缀，├└ 是它的子段，│├ 再下一层；★ 标的是值得先看的几段。
+	// 点位名与设计文档 ①–⑧ 编号的对应见 docs/probe-points.md。
+	fmt.Printf("缩进 = 包含关系（├└ 为上一层的子段）；★ = 重点段\n\n")
 
 	// 1) 各节点内部阶段
 	lastNode := ""
@@ -1132,8 +1141,8 @@ type netCol struct {
 func netCols() []netCol {
 	return []netCol{
 		{"net.client↔envoy-out单程(UDS)", "kitex-client", "★等待对端(纯网络)", "envoy-out"},
-		{"net.envoy-out↔envoy-in单程(跨机)", "envoy-out", "⑤→⑥ ★等待上游", "envoy-in"},
-		{"net.envoy-in↔server单程(UDS)", "envoy-in", "⑤→⑥ ★等待上游", "kitex-server"},
+		{"net.envoy-out↔envoy-in单程(跨机)", "envoy-out", "★等待上游", "envoy-in"},
+		{"net.envoy-in↔server单程(UDS)", "envoy-in", "★等待上游", "kitex-server"},
 	}
 }
 
