@@ -156,6 +156,34 @@ ConnectionImpl` —— 主动发起的连接天然是派生类,被 accept 的不
 `kitex_probe_upstream_` 即可。改那个核心接口头会触发 1134 个动作的大范围重编,
 而且多一处 rebase 冲突点;走派生类判定是 26 秒的增量。
 
+### 下游写：RPC 结束之后才发生的点位
+
+`dn_writev_*` 有个特殊之处：**它发生在 `rpc_done` 之后**。conn_manager 里
+`write()` 只入队，真正的 writev 由事件循环稍后执行，那时普通 `rpcEvent`
+已经查不到绑定了（实测 `dn_writev_*` 0 条）。
+
+解法不是「不擦绑定」—— 那在流水线下会出错：请求 N 的 writev 还没跑，
+N+1 的 `bindTrace` 就把 `bindings[conn]` 覆盖了，N 的写会被记到 N+1 头上。
+
+改为**单独一个 `finishing` 槽**：`endRpc` 把 binding 移交过去，`bindings`
+照常擦（`isSampled` 等语义不变）；下游 writev 走 `rpcEventTail()` 只查这个槽，
+`dn_writev_done` 记完即释放（否则 `onWriteReady` 后续的空写会继续挂在它名下）。
+
+**一条连接同时最多容纳一个「待写出」的 RPC。** 前一个还没写出就又结束一个时，
+计入 `g_write_lost` 并丢弃 —— **宁可丢也不能误记**。这也是诚实的：流水线下
+一次 writev 可能同时写出多个响应，「某个 RPC 的 writev」本就不可拆。
+
+该计数出现在收尾行里，**是完整性判据的一部分**：
+
+```
+[probe] node=envoy-out host=suzhou950 记录=832004 落盘=832004 丢弃=0 下游写未归属=0
+```
+
+实测 c=1 / 16 / 64 三档均为 0（Kitex 用连接池，每条连接串行，因果上不会出现
+流水线）。c=64、每节点 32000 条 trace 的因果校验：`dn_writev_start` 早于本条
+`dn_socket_write_done` 的**倒挂 0 条**，距入队超 50ms 的**异常 0 条**，
+入队→writev 的 p50 为 7.0 / 10.5 µs。
+
 ### 已知缺口
 
 | 想测但目前测不了 | 为什么还没做 |
