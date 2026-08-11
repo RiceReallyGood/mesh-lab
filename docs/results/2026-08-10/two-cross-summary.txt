@@ -17,8 +17,11 @@
 
   设「N 总」= 节点 N 观测到的最早点到最晚点，
     「N 等」= 节点 N 花在等下一跳身上的时间，取值为：
-        Envoy 各跳     up_write_done → up_epoll_wake   （请求写出 → 响应把 epoll 唤醒）
-        kitex-client   mesh_socket_read_start → mesh_first_byte
+        Envoy 各跳     up_writev_done → up_epoll_wake         （请求真正写出 → 响应把 epoll 唤醒）
+        kitex-client   mesh_socket_read_start → mesh_np_epoll_wake
+      **两端都收在「本机与内核交接」那一刻**：起点不取入队（那时请求还没离开本机），
+      终点不取首字节可读（那已经在 readv、buffer、派发之后）。两头的本地开销
+      算进「往返」的话，会同时高估链路、低估节点自身。
 
   **「N 自身」= N 总 − N 等**
       N 真正占用 CPU 的时间：解析、路由、编解码、业务逻辑。

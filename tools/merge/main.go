@@ -459,9 +459,11 @@ type chainLink struct {
 // 而**它等下一跳的时间 − 下一跳的总时长 = 两者之间的往返传输**。
 // 两式交替套用，从 client 一路推到 server，各段相加恰好等于端到端（望远镜求和）。
 //
-// Envoy 侧取「纯等待」（up_write_done → up_epoll_wake）而不是 ⑤→⑥：
-// epoll 就绪之后的 readv、buffer、filter 派发是本跳自己的 CPU 时间，
-// 算进「传输」会高估链路。
+// Envoy 侧取「纯等待」（up_writev_done → up_epoll_wake）而不是 ⑤→⑥：
+// 起点若取 up_write_done（入队），请求还没离开本机，等事件循环那段会被算成网络；
+// 终点若取 up_first_byte，epoll 就绪之后的 readv、buffer、filter 派发是本跳自己的
+// CPU 时间，算进「传输」会高估链路。**下面 printBreakdown 打印的定义必须与这里一致**
+// —— 那段文字曾经落后于本函数，输出里印着的是已经改掉的旧口径。
 func waitOf(s *nodeSpan) (int64, bool) {
 	at := map[string]int64{}
 	for _, ev := range s.Events {
@@ -612,8 +614,11 @@ func printBreakdown(traces map[string][]Event) {
 	fmt.Printf("\n")
 	fmt.Printf("  设「N 总」= 节点 N 观测到的最早点到最晚点，\n")
 	fmt.Printf("    「N 等」= 节点 N 花在等下一跳身上的时间，取值为：\n")
-	fmt.Printf("        Envoy 各跳     up_write_done → up_epoll_wake   （请求写出 → 响应把 epoll 唤醒）\n")
-	fmt.Printf("        kitex-client   mesh_socket_read_start → mesh_first_byte\n")
+	fmt.Printf("        Envoy 各跳     up_writev_done → up_epoll_wake         （请求真正写出 → 响应把 epoll 唤醒）\n")
+	fmt.Printf("        kitex-client   mesh_socket_read_start → mesh_np_epoll_wake\n")
+	fmt.Printf("      **两端都收在「本机与内核交接」那一刻**：起点不取入队（那时请求还没离开本机），\n")
+	fmt.Printf("      终点不取首字节可读（那已经在 readv、buffer、派发之后）。两头的本地开销\n")
+	fmt.Printf("      算进「往返」的话，会同时高估链路、低估节点自身。\n")
 	fmt.Printf("\n")
 	fmt.Printf("  **「N 自身」= N 总 − N 等**\n")
 	fmt.Printf("      N 真正占用 CPU 的时间：解析、路由、编解码、业务逻辑。\n")
