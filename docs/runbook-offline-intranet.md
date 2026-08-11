@@ -147,8 +147,8 @@ ldd   ./envoy-static
 | 来源路径（构建机上） | 体积 | 作用 |
 |---|---|---|
 | `envoy/bazel-bin/source/exe/envoy-static` | **810 MB** | Envoy 本体，含全部打点 |
-| `mesh-lab/demo/bin/server` | 20 MB | Kitex 服务端 + 打点 |
-| `mesh-lab/demo/bin/client` | 21 MB | Kitex 客户端 + 压测器 + 打点 |
+| `mesh-lab/demo/bin/reciever` | 23 MB | Kitex 服务端 + 打点（kitex-benchmark 派生） |
+| `mesh-lab/demo/bin/bencher` | 24 MB | 加压器 + 打点（kitex-benchmark 派生） |
 | `mesh-lab/demo/bin/merge` | 3.1 MB | trace 合并分析工具 |
 | `mesh-lab/envoy-conf/` | 36 KB | 6 份 Envoy 配置 |
 | `mesh-lab/scripts/` | 44 KB | run-*.sh 运行脚本 |
@@ -170,8 +170,8 @@ ldd   ./envoy-static
 ```bash
 export PATH=~/sdk/go/bin:$PATH
 cd ~/envoy_kitex/mesh-lab/demo
-CGO_ENABLED=0 go build -o bin/server ./server
-CGO_ENABLED=0 go build -o bin/client ./client
+CGO_ENABLED=0 go build -o bin/reciever ../../kitex-benchmark/thrift/kitex
+CGO_ENABLED=0 go build -o bin/bencher  ../../kitex-benchmark/thrift/kitex/client
 cd ~/envoy_kitex/mesh-lab/tools/merge
 CGO_ENABLED=0 go build -o ~/envoy_kitex/mesh-lab/demo/bin/merge .
 
@@ -389,18 +389,20 @@ cd ~/meshlab
 
 # 终端 1：server
 KITEX_PROBE_HOST=$(hostname) \
-  ./bin/server -addr "$RUN/app.sock" -trace "$RUN/trace-server.ndjson"
+  ./bin/reciever -addr "$RUN/app.sock" -proto ttheader -node kitex-server \
+                 -trace "$RUN/trace-server.ndjson"
 
 # 终端 2：envoy（tmux 里跑）
 KITEX_PROBE_HOST=$(hostname) \
 KITEX_PROBE_PATH="$RUN/trace-envoy.ndjson" \
 KITEX_PROBE_NODE=envoy \
-  ./bin/envoy-static -c ./envoy-conf/single-hop.yaml --log-level info --base-id 1
+  ./bin/envoy-static -c ./envoy-conf/single-hop.yaml --log-level info --use-dynamic-base-id
 
 # 终端 3：压测
 KITEX_PROBE_HOST=$(hostname) \
-  ./bin/client -target "$RUN/out.sock" -service echo-server \
-               -n 300 -d 0 -c 1 -sample 1.0
+  ./bin/bencher -addr "$RUN/out.sock" -proto ttheader -svc echo-server \
+                -trace "$RUN/trace-client.ndjson" -node kitex-client \
+                -b 128 -c 1 -qps 300 -t 1 -warmup 1 -sample 1.0
 ```
 
 **看到这一行就说明链路是对的**：
@@ -520,8 +522,8 @@ kitex-benchmark 插桩源码树）复制进 `demo/vendor/`。**产物是自包�
 ```bash
 export PATH=~/sdk/go/bin:$PATH
 cd ~/envoy_kitex/mesh-lab/demo
-GOFLAGS="-mod=vendor" GOPROXY=off CGO_ENABLED=0 go build -o bin/server ./server
-GOFLAGS="-mod=vendor" GOPROXY=off CGO_ENABLED=0 go build -o bin/client ./client
+GOFLAGS="-mod=vendor" GOPROXY=off CGO_ENABLED=0 go build -o bin/reciever ./thrift/kitex
+GOFLAGS="-mod=vendor" GOPROXY=off CGO_ENABLED=0 go build -o bin/bencher  ./thrift/kitex/client
 ```
 
 `GOPROXY=off` 是**故意加的**：它让 Go 在试图联网时立刻报错而不是长时间超时重试。
@@ -585,7 +587,8 @@ crate 解析可能仍然联网。**建议先在构建机上做一次断网演练
 | ~~Go 二进制报缺 `libresolv.so.2`~~ | 默认编法开了 CGO | **同上，已排除**。若真缺，`CGO_ENABLED=0` 重编（§2.2 可选加固） |
 | **Envoy 一个点位都没有** | 没设 `KITEX_PROBE_PATH`/`KITEX_PROBE_NODE`。**不落盘且不报错** | §3.3 |
 | Envoy 启动报 `Too many open files` | fd 软限 1024 不够，**而且只是 warn** | `ulimit -n 65536` |
-| 同机两个 Envoy 互相杀死 | `--base-id` 相同，热重启机制生效 | 给不同 base-id |
+| 同机两个 Envoy 互相杀死 | `--base-id` 相同，热重启机制生效 | 用 `--use-dynamic-base-id`，各实例自动取不同值 |
+| Envoy 报 `cannot open shared memory region /envoy_shared_memory_NNN` | 固定 base-id 撞上**同机其他用户**的（该文件 0600 且属创建者） | 同上 |
 | ssh 一断 Envoy 就没了 | Envoy 收到 SIGTERM 优雅退出 | 用 tmux 托管 |
 | trace 文件比预期少一截 | 最后一批还在内存，线程退出才刷盘 | 先停进程再读；用 SIGTERM 不要 `kill -9` |
 | `*.ndjson` 匹配不到文件 | Envoy 按线程分文件，名字带 `.<tid>` | 用 `*.ndjson*` |
@@ -616,7 +619,9 @@ cp -r envoy-conf scripts ~/envoy_kitex/mesh-lab/
 RUN=${MESHLAB_RUN:-/tmp/kitex-demo-$(id -un)}
 ulimit -n 65536 && mkdir -p "$RUN"
 cd ~/envoy_kitex/mesh-lab && ./scripts/run-single-hop.sh start && ./scripts/run-single-hop.sh status
-cd demo && KITEX_PROBE_HOST=$(hostname) ./bin/client -n 300 -d 0 -c 1 -sample 1.0
+cd demo && KITEX_PROBE_HOST=$(hostname) ./bin/bencher -addr "$RUN/out.sock" \
+    -proto ttheader -svc echo-server -trace "$RUN/trace-client.ndjson" \
+    -b 128 -c 1 -qps 300 -t 1 -warmup 1 -sample 1.0
 
 # 4. 停 + 分析（顺序不能换）
 cd .. && ./scripts/run-single-hop.sh stop && sleep 5

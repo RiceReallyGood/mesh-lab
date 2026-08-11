@@ -45,6 +45,8 @@ Kitex RPC 经 Envoy 双跳 sidecar 的**端到端时延归因**实验。
 | 看实测结论 | [docs/test-report.md](docs/test-report.md) |
 | 了解每个点位的含义 | [docs/probe-points.md](docs/probe-points.md) |
 | 知道**还有什么测不到** | [docs/probe-coverage-audit.md](docs/probe-coverage-audit.md) |
+| 搞清**加压器与 kitex-benchmark 的关系** | [docs/demo-vs-kitex-benchmark.md](docs/demo-vs-kitex-benchmark.md) —— 改了哪 62 行、为什么非改不可、哪些数字可比 |
+| 看**包大小 × 并发**的归因矩阵 | [docs/bench-matrix-2026-08-11.md](docs/bench-matrix-2026-08-11.md) —— 含 1GbE 把矩阵卡掉一半的实测 |
 | 专门评测网卡 | [docs/runbook-nic-benchmark.md](docs/runbook-nic-benchmark.md) |
 | 看设计与取舍 | [docs/specs/](docs/specs/) |
 
@@ -55,11 +57,20 @@ Kitex RPC 经 Envoy 双跳 sidecar 的**端到端时延归因**实验。
 | 仓库 | 分支 | 内容 |
 |---|---|---|
 | [envoy](https://github.com/RiceReallyGood/envoy) | `feat/thrift-ttheader-transport` | **可上游** —— 让 `thrift_proxy` 原生识别 Kitex 的 TTHeader（magic `0x1000`），含 47 个单测 |
-| [envoy](https://github.com/RiceReallyGood/envoy) | `wip/kitex-e2e-probe` | 基于上一分支追加侵入式打点，**不上游** |
-| [kitex](https://github.com/RiceReallyGood/kitex) | `feat/detailed-trace-events` | 12 个细粒度事件 + 承接 netpoll 时间戳的槽位 |
-| [netpoll](https://github.com/RiceReallyGood/netpoll) | `feat/meshlab-read-probe` | 读路径 5 个点位（epoll 唤醒 / readv / 唤醒通知） |
+| [envoy](https://github.com/RiceReallyGood/envoy) | `wip/kitex-e2e-probe` | 基于上一分支追加侵入式打点，**每跳 24 个点位**，**不上游** |
+| [kitex](https://github.com/RiceReallyGood/kitex) | `feat/detailed-trace-events` | 11 个细粒度事件 + 承接 netpoll 读写时间戳的槽位 |
+| [netpoll](https://github.com/RiceReallyGood/netpoll) | `feat/meshlab-read-probe` | 读路径 5 点 + 写路径 4 点，**客户端与服务端两侧都有** |
+| [kitex-benchmark](https://github.com/RiceReallyGood/kitex-benchmark) | `feat/meshlab-probe` | **加压器**：对 3 个上游文件共 62 行改动 + 1 个适配层文件，`runner/`、`perf/` 一行未动 |
 
-`kitex-benchmark` 未修改，只借用它已生成的 echo `kitex_gen` 代码。
+一条被采样的请求在跨机双跳下产生 **107 个去重点位名 / 约 119 个事件**。
+
+**加压器就是 kitex-benchmark 的 kitex-echo**（2026-08-11 起）。归因结论的可信度
+有一半压在加压器上 —— 自己写一份的话并发模型、限速、预热、分位数算法都是我们的
+实现，别人无从核对。改动清单与「为什么每一处非改不可」见
+[docs/demo-vs-kitex-benchmark.md](docs/demo-vs-kitex-benchmark.md)。
+
+> 所有改动**默认关闭 = 上游行为**（不给 `-proto` 就是 Framed，不给 `-trace`
+> 就不挂探针），所以同一个二进制既是我们的加压器，也是干净的公认基准。
 
 ## 本仓库结构
 
@@ -94,9 +105,13 @@ varint 在 TTHeader 里都是定长整数 —— 两者线格式不兼容。所�
 `merge` 强制：同机内才允许相减，跨机只能用差值法导出往返，并提供 `--inject-skew`
 证明分析对偏斜免疫（注入任意偏移后各段时长逐位不变）。
 
-**未采样路径必须近乎零开销**，否则打点本身会主导压测结果。实测 1% 采样时开销低于
-3% 的噪声下限；100% 采样有 6.6% 开销。
+**未采样路径必须近乎零开销**，否则打点本身会主导压测结果。2026-08-10 三组交错实测
+（探针不激活 / 激活但不采样 / 全采样，c=1）**差异全部落在噪声内**
+（+0.9 % / −1.0 %，而同一配置的轮间波动最大到 9.7 %）。
+**这只证明「低于本底噪声」，不等于零开销** —— c=1 的端到端 p50 被跨机等待主导，
+对几微秒的插桩开销本就不敏感。压测归因仍建议用 1 %~5 % 采样，
+未决项见 [test-report.md](docs/test-report.md) §7。
 
 **整套插桩的下界是 socket 系统调用** —— 网卡、驱动、中断、协议栈全在盲区。
 平时无所谓，但要评测网卡时这恰好是唯一该看的部分，补法见
-[probe-coverage-audit.md](docs/probe-coverage-audit.md) §5。
+[probe-coverage-audit.md](docs/probe-coverage-audit.md) §五。

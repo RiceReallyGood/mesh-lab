@@ -192,8 +192,9 @@ export GOSUMDB=off
 ```bash
 export PATH=~/sdk/go1.22.12/bin:$PATH
 cd <源码树>/mesh-lab/demo
-go build -o bin/server ./server
-go build -o bin/client ./client
+# 加压器/被压端来自 kitex-benchmark 仓（见 demo-vs-kitex-benchmark.md）
+(cd ../../kitex-benchmark && go build -o ../mesh-lab/demo/bin/reciever ./thrift/kitex \
+                          && go build -o ../mesh-lab/demo/bin/bencher  ./thrift/kitex/client)
 ls -l bin/
 ```
 
@@ -213,7 +214,8 @@ go test -race -run TestReadProbe -v -count=1 .
 ```bash
 export KITEX_PROBE_HOST=hostB          # ← 必须两台不同！否则跨机会被误判成同机
 mkdir -p /tmp/trace
-./bin/server -addr 0.0.0.0:8888 -trace /tmp/trace/server.ndjson -node kitex-server
+./bin/reciever -addr 0.0.0.0:8888 -proto ttheader -node kitex-server \
+               -trace /tmp/trace/server.ndjson
 ```
 
 **机器 A（客户端）**：
@@ -221,12 +223,14 @@ mkdir -p /tmp/trace
 ```bash
 export KITEX_PROBE_HOST=hostA
 mkdir -p /tmp/trace
-./bin/client -addr <机器B的IP>:8888 \
-             -trace /tmp/trace/client.ndjson -node kitex-client \
-             -concurrency 16 -duration 60s -sample 0.01
+./bin/bencher -addr <机器B的IP>:8888 -proto ttheader -svc echo-server \
+              -trace /tmp/trace/client.ndjson -node kitex-client \
+              -b 1024 -c 16 -qps 16000 -t 60 -warmup 3 -sample 0.01
 ```
 
-`-sample 0.01` 是 1% 采样。**压测时不要用 1.0** —— 实测 100% 采样有 6.6% 的开销，会改变被测系统的行为。
+`-sample 0.01` 是 1% 采样。**压测时不要用 1.0** —— 事件量会爆炸（c=16 全采样是千万级），
+落盘本身就会变成瓶颈。采样开销本身实测低于本底噪声，但那是 c=1 端到端 p50 的结论，
+不能外推到高并发（见 `test-report.md` §7）。
 
 ### 3.3 采集结果
 
@@ -276,9 +280,9 @@ bazel 高并行会耗尽 inode，报错是 "No space left on device" 但 `df -h`
 
 ```bash
 # 机器 A
-./envoy-static -c <源码树>/mesh-lab/envoy-conf/two-hop-out-remote.yaml --base-id 1
+./envoy-static -c <源码树>/mesh-lab/envoy-conf/two-hop-out-remote.yaml --use-dynamic-base-id
 # 机器 B
-./envoy-static -c <源码树>/mesh-lab/envoy-conf/two-hop-in-remote.yaml --base-id 2
+./envoy-static -c <源码树>/mesh-lab/envoy-conf/two-hop-in-remote.yaml --use-dynamic-base-id
 ```
 
 **`--base-id` 必须不同** —— 相同 base-id 的实例会通过共享域套接字互相杀掉（热重启机制）。
@@ -318,7 +322,7 @@ bazel 高并行会耗尽 inode，报错是 "No space left on device" 但 `df -h`
 ```bash
 for c in 1 2 4 8 16 32 64 128; do
   echo "=== concurrency=$c ==="
-  ./bin/client -addr <IP>:8888 -concurrency $c -duration 20s -sample 0
+  ./bin/bencher -addr <IP>:8888 -proto ttheader -svc echo-server -c $c -qps 0 -t 20
 done
 ```
 

@@ -6,7 +6,8 @@
 ## 本轮做了什么
 
 每跳 Envoy 横跨两条连接（下游 UDS、上游 TCP），四个 socket 边界过去只测了上游那条。
-本轮补上下游读（3 点）与下游写（2 点），**每跳点位数 15 → 20**；
+本轮补上下游读（3 点）、下游写（入队 2 点 + writev 2 点）与上游 writev（2 点），
+**每跳点位数 15 → 24**；
 同时把 netpoll 读路径的 5 个点位从「仅客户端」扩到**服务端也有**（server 21 → 26），
 并新增写路径 4 个点位（client 25 → 29、server 26 → 30），Go 侧收发终于对称。
 
@@ -40,12 +41,20 @@ two   client(950) ─UDS─▶ envoy-out(950) ──TCP:15006──▶ envoy-in(
 [probe] node=kitex-server 总请求=1000 采样=1000 丢弃=0
 ```
 
-逐条核对**去重后的点位名**：client 1000×29、envoy-out 1000×**22**、
-envoy-in 1000×**22**、server 1000×30，共 108998 个事件。
+逐条核对**去重后的点位名**：client 1000×29、envoy-out 1000×**24**、
+envoy-in 1000×**24**、server 1000×30，共 118992 个事件。
 
 > **Envoy 侧不能再数事件数了。** `onWriteReady()` 每条 trace 会触发多次
 > （第 1 次是真正的请求发送，之后是缓冲区已排空的空写），所以事件数是 24~30 不等，
-> 而**去重后的点位名恒为 22**。merge 取同名点最早一次，恰好取到对的那个。**判据是「记录==落盘 且 丢弃=0」，不是数行数。**
+> 而**去重后的点位名恒为 24**。merge 取同名点最早一次，恰好取到对的那个。**判据是「记录==落盘 且 丢弃=0」，不是数行数。**
+
+> ⚠️ **这一轮的 `dn_writev_*` 每条 trace 有 2~3 次，那是中间版本的行为。**
+> 本轮跑于 20:19，用的是 `envoy@cad62df`（「干脆不擦绑定」），多出来的是
+> `onWriteReady` 的空写。20:31 的 `envoy@981475a` 改成了 `finishing` 槽 +
+> 写完即释放，当前口径下应为**每条 trace 1 次**。
+> **分位数不受影响**（merge 取最早一次，取到的就是真正那次 writev），
+> 但按事件数核对完整性得用当前口径重跑。机制见
+> [`../../probe-points.md`](../../probe-points.md) §「下游写」。
 
 服务端 21 → 30、客户端 25 → 29，来自 netpoll 读路径 5 点（仅服务端新增）与写路径 4 点（两侧新增）。
 
@@ -106,15 +115,20 @@ epoll 唤醒→readv→LinkBuffer→调度这一整段不可见，被算进了 U
 
 | 段 | avg |
 |---|---:|
-| ⓪ netpoll 收包（到 OnRead） | **14.8 µs** |
-| 　├ poller 事件排队 | 451 ns |
-| 　├ **readv 系统调用** | **6.0 µs** |
-| 　├ LinkBuffer 入队 | 145 ns |
-| 　└ **goroutine 调度延迟** | **7.8 µs** |
+| ⓪ netpoll 收包（到 OnRead） | **12.9 µs** |
+| 　├ poller 事件排队 | 345 ns |
+| 　├ **readv 系统调用** | **4.4 µs** |
+| 　├ LinkBuffer 入队 | 199 ns |
+| 　└ **goroutine 调度延迟** | **7.3 µs** |
 
-于是 `UDS 往返 envoy-in↔server` 从 34.7 µs 降到 **13.6 µs**，
-`kitex-server 自身` 从 19.2 µs 升到 **34.5 µs** ——
-约 15 µs 从「不可解释的往返」挪进了服务端自己的收包路径。
+于是 `UDS 往返 envoy-in↔server` 从 34.7 µs 降到 **5.4 µs**，
+`kitex-server 自身` 从 19.2 µs 升到 **32.1 µs**。
+
+> **别拿这里的数字和早前几版对**。同一天里 merge 的区间口径连改了三版
+> （服务端 netpoll 五段落地 → 按「谁在干活」重新划分等待区间 → 节点区间按点位
+> 去重），这张表跟着变过三次（18.0 → 14.8 → 12.9 µs）。
+> **上表已对齐本目录 `two-cross-detail.txt` / `two-cross-summary.txt` 的最终口径**，
+> 口径变动的完整记录见 [`../../test-report.md`](../../test-report.md) §2.6。
 
 **开销**：服务端探针只能连接级常开，所以专门测了一轮（`KITEX_PROBE_NETPOLL_SERVER`
 0/1 交错 3 轮、`-sample 0`）：均值 241.3 vs 239.0 µs，**开着比关着还「快」1.0%**，
@@ -122,34 +136,44 @@ epoll 唤醒→readv→LinkBuffer→调度这一整段不可见，被算进了 U
 
 ## writev 全部拆到系统调用：一个长期结论被推翻
 
-Envoy 侧也补了 `up_writev_start/done`（`onWriteReady()` 里 `doWrite()` 前后），
+Envoy 侧也补了 `up_writev_start/done` 与 `dn_writev_start/done`
+（`onWriteReady()` 里 `doWrite()` 前后，按 side 二选一），
 现在四个方向都能看到真正的系统调用。
 
-**同机同传输的干净对比（920B，两者都写 UDS）**：
+**同机同传输的干净对比有两对**（avg，两台机器各一对，都写 UDS）：
 
-| | writev 系统调用 |
-|---|---:|
-| kitex-server（Go） | **3.2 µs** |
-| envoy-in 上游（C++） | **3.1 µs** |
+| 机器 | Go 侧 | Envoy 侧 | 比值 |
+|---|---:|---:|---:|
+| 950 | kitex-client **1.8 µs** | envoy-out 下游 **1.9 µs** | 1.06 |
+| 920B | kitex-server **2.9 µs** | envoy-in 上游 **3.4 µs** | 1.17 |
 
-**基本一致 —— 7~10 倍彻底不存在。**
+**两对都是一个量级 —— 7~10 倍彻底不存在。**
+只有一对时还能说样本太少，两台机器、两个方向都复现，结论就站得住了。
 
-Envoy 侧现在三段分开：
+Envoy 侧现在三段分开（avg）：
 
-| 段 | envoy-out | envoy-in |
-|---|---:|---:|
-| 写socket(仅入队) | 300 ns | 770 ns |
-| 入队 → 真正写出（事件循环调度） | 1.4 µs | 2.6 µs |
-| **★ writev 系统调用** | **3.2 µs** | **3.1 µs** |
+| 段 | envoy-out 上游 | envoy-in 上游 | envoy-out 下游 | envoy-in 下游 |
+|---|---:|---:|---:|---:|
+| 写socket(仅入队) | 297 ns | 751 ns | 731 ns | 1.1 µs |
+| 入队 → 真正写出（事件循环调度） | 2.3 µs | 3.8 µs | **7.9 µs** | **11.7 µs** |
+| **★ writev 系统调用** | 5.1 µs | 3.4 µs | 1.9 µs | 6.4 µs |
 
 「入队 → 真正写出」是 Envoy 异步写模型的固有延迟，Go 的同步 Flush 没有对应物 ——
 **这才是两种模型的真实差别，而不是系统调用快慢。**
+下游那一列明显更长，是因为下游写发生在 `rpc_done` **之后**，
+中间隔着 `deferredDelete` 与一整轮事件循环 —— **排到写的时机不同，不是 socket 更慢。**
 
-### 遗留：下游 writev 采不到
+### ~~遗留：下游 writev 采不到~~ —— 当晚就补上了
 
-`dn_writev_*` 实测 0 条。下游响应的 `write()` 只入队，真正的 writev 由事件循环
-稍后执行，而那时 `doDeferredRpcDestroy` 已经 `KITEX_PROBE_END` 释放了绑定。
-要采到得改绑定生命周期，有泄漏风险，本轮没做。
+本节原写着「`dn_writev_*` 实测 0 条 …… 要采到得改绑定生命周期，有泄漏风险，
+本轮没做」。当天 20:31 的 `envoy@981475a` 做了：`endRpc` 把 binding 移交给一个
+**单独的 `finishing` 槽**（不是「不擦绑定」—— 那在流水线下会把 N 的写记到
+N+1 头上），下游 writev 走 `rpcEventTail()` 查这个槽，写完即释放。
+一条连接同时最多容纳一个待写出的 RPC，超出的计入 `下游写未归属` 并丢弃。
+
+**本目录的数据介于两者之间**（跑于 20:19，用的是中间版本），
+所以 `dn_writev_*` 有数、但每条 trace 2~3 次。上文「数据完整性」一节有说明。
+下面的分解表已包含下游 writev。
 
 ## Go 侧写路径拆开
 
@@ -169,11 +193,12 @@ Go 侧写 socket 的开销**几乎全在系统调用本身**，LinkBuffer 管理
 **但这同时推翻了「Go 侧写 socket 比 Envoy 贵 7–10 倍」这个结论** ——
 那个比较根本不成立。Envoy 的 `up_encode_done → up_socket_write_done` 括住的是
 `ConnectionImpl::write()`，而它只做 `write_buffer_->move(data)` +
-`activateFileEvents`；**真正的 writev 在 `onWriteReady()` 里、由事件循环稍后执行，
-目前没有点位**。拿入队时间去比系统调用时间，差 7–10 倍毫不奇怪。
+`activateFileEvents`；**真正的 writev 在 `onWriteReady()` 里、由事件循环稍后执行**。
+拿入队时间去比系统调用时间，差 7–10 倍毫不奇怪。
 
-在给 Envoy 的 `doWrite()` 补上点位之前，**任何「Go 写 socket 比 Envoy 慢」的说法
-都不要再提**。
+> 本节原来的结尾是「在给 Envoy 的 `doWrite()` 补上点位之前，任何『Go 写 socket
+> 比 Envoy 慢』的说法都不要再提」。**同一天补上了**（`up_writev_*` / `dn_writev_*`），
+> 补完的干净对比见上面「writev 全部拆到系统调用」一节：**两边一个量级。**
 
 ## 归因闭合
 

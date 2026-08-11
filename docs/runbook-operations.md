@@ -42,7 +42,7 @@ mkdir -p ~/envoy_kitex && cd ~/envoy_kitex
 git clone -b main                          git@github.com:RiceReallyGood/mesh-lab.git
 git clone -b feat/detailed-trace-events    git@github.com:RiceReallyGood/kitex.git
 git clone -b feat/meshlab-read-probe       git@github.com:RiceReallyGood/netpoll.git
-git clone                                  git@github.com:cloudwego/kitex-benchmark.git
+git clone -b feat/meshlab-probe            git@github.com:RiceReallyGood/kitex-benchmark.git
 git clone -b wip/kitex-e2e-probe           git@github.com:RiceReallyGood/envoy.git
 ```
 
@@ -52,7 +52,7 @@ git clone -b wip/kitex-e2e-probe           git@github.com:RiceReallyGood/envoy.g
 ~/envoy_kitex/
 ├── envoy/            wip/kitex-e2e-probe        插桩版（含 TTHeader transport）
 ├── kitex/            feat/detailed-trace-events
-├── kitex-benchmark/  main                       只用它的 echo kitex_gen，未修改
+├── kitex-benchmark/  feat/meshlab-probe        **加压器**（fork 自 cloudwego，62 行改动）
 ├── netpoll/          feat/meshlab-read-probe
 └── mesh-lab/         main
 ```
@@ -104,14 +104,32 @@ tail -f ~/build-envoy.log
 export PATH=~/sdk/go/bin:$PATH
 export GOPROXY=https://goproxy.cn,direct GOSUMDB=off GOFLAGS=-mod=mod
 
-cd ~/envoy_kitex/mesh-lab/demo
-go build -o bin/server ./server
-go build -o bin/client ./client
+# ── 加压器/被压端：**在 kitex-benchmark 仓里构建**（2026-08-11 起）──
+# 它就是官方的 kitex-echo，只加了 62 行适配（见 docs/demo-vs-kitex-benchmark.md）。
+# 自研的 demo/client、demo/server 已退役，不要再用它们出数据。
+export GOTOOLCHAIN=local        # go.mod 里写着 toolchain go1.23.0，本地 go 更新时会去下载
+cd ~/envoy_kitex/kitex-benchmark
+go mod tidy                                    # 首次需要，要拉 juju/ratelimit 等三个新依赖
+go build -o ~/envoy_kitex/mesh-lab/demo/bin/bencher  ./thrift/kitex/client
+go build -o ~/envoy_kitex/mesh-lab/demo/bin/reciever ./thrift/kitex
 
 # merge 是独立 module，要单独构建
 cd ~/envoy_kitex/mesh-lab/tools/merge
 go build -o ~/envoy_kitex/mesh-lab/demo/bin/merge .
+
+# 旧的自研 demo（仅在 MESHLAB_LEGACY=1 时需要）
+# cd ~/envoy_kitex/mesh-lab/demo && go build -o bin/server ./server && go build -o bin/client ./client
 ```
+
+> **构建后必查：插桩分支有没有真的链进去。**
+> `replace` 只在主模块生效，kitex-benchmark 的 go.mod 必须自己重列一遍
+> `kitex`/`netpoll` 的 replace —— 少一条就会去拉官方 release 版，**插桩点位
+> 一个都没有，而且不报错**，表现为「trace 里只有 rpc_start/finish」。
+>
+> ```bash
+> cd ~/envoy_kitex/kitex-benchmark && go list -m github.com/cloudwego/kitex github.com/cloudwego/netpoll
+> # 期望两行都带 "=> ../kitex" / "=> ../netpoll"
+> ```
 
 ### 2.3 构建后自检
 
@@ -145,7 +163,9 @@ cd ~/envoy_kitex/mesh-lab
 ./scripts/run-single-hop.sh start          # start | stop | status
 
 cd demo
-KITEX_PROBE_HOST=suzhou950 ./bin/client -n 300 -d 0 -c 1 -sample 1.0
+KITEX_PROBE_HOST=suzhou950 ./bin/bencher -addr "$RUN/out.sock" \
+    -proto ttheader -svc echo-server -trace "$RUN/trace-client.ndjson" \
+    -b 128 -c 1 -qps 300 -t 2 -warmup 1 -sample 1.0
 ```
 
 ### 3.2 双跳（同机两个 Envoy）
@@ -171,7 +191,7 @@ cd ~/envoy_kitex/mesh-lab
 ./scripts/run-cross-machine.sh start        # 自动 rsync 二进制到 920B
 ```
 
-脚本会把 `envoy-static` 与 `server` 推到对端、起进程、检查监听状态。
+脚本会把 `envoy-static` 与 `reciever` 推到对端、起进程、检查监听状态。
 `collect` 把对端的 trace 拉回本机。
 
 **同一个脚本还提供归因阶梯的另外两级**（`TOPO` 默认 `two`）：
@@ -212,22 +232,33 @@ ENVOY_CONCURRENCY=2 ./scripts/run-cross-machine.sh start
 ### 3.5 压测参数
 
 ```bash
-./bin/client \
-  -target "$RUN/out.sock" \             # 默认值即 $RUN/out.sock，通常不用写
-  -service echo-server \               # 写入 TTHeader ToService，供 Envoy 路由
-  -service echo-server \               # 写入 TTHeader ToService，供 Envoy 路由
-  -c 16 \                              # 并发
-  -d 60s \                             # 时长；-d 0 时改用 -n 指定请求数
-  -sample 0.05 \                       # 采样率
-  -size 128                            # payload 字节数
+./bin/bencher \
+  -addr "$RUN/out.sock" \    # 目标；UDS 路径或 host:port（WithHostPorts 内建 UDS 支持）
+  -proto ttheader \          # **过 Envoy 必须给**；默认 framed = 上游行为
+  -svc echo-server \         # 写入 TTHeader ToService，要与 Envoy 路由规则一致
+  -trace "$RUN/trace-client.ndjson" \   # **留空则完全不挂探针**
+  -node kitex-client \
+  -c 16 \                    # 并发（runner 的 flag）
+  -qps 16000 \               # 目标速率；0 = 不限速（闭环打满）
+  -t 60 \                    # 计量时长，秒
+  -warmup 3 \                # 预热秒数，**预热流量不会被采样**
+  -b 1024 \                  # payload 字节数
+  -sample 0.05               # 采样率
 ```
+
+**flag 分两类**：`-addr/-c/-qps/-t/-b/-warmup/-method/-pool/-sleep` 是
+kitex-benchmark 自带的；`-proto/-svc/-trace/-sample/-node` 是本项目加的，
+**全部默认关闭 = 上游行为**。
 
 **采样率怎么选**：
 
 | 场景 | 采样率 | 理由 |
 |---|---|---|
 | 验证链路 / 调试 | `1.0` | 请求数少，要每条都有 |
-| 压测归因 | `0.01` ~ `0.05` | 实测 100% 采样有 6.6% 开销，会改变被测系统行为；1% 时开销低于 3% 的噪声下限 |
+| 压测归因 | 让每格落在 **3000 条左右** | 太少 p99 不可信，太多事件量爆炸（c=16 全采样是千万级）。`bench-matrix.sh` 里按格给了一张表 |
+
+> 归因矩阵不用手工拼这行命令，用 `./scripts/bench-matrix.sh`（见
+> [bench-matrix-2026-08-11.md](bench-matrix-2026-08-11.md)）。
 | 极限吞吐 | `0` | 完全关闭 |
 
 ---
@@ -373,7 +404,8 @@ raw = df[~df.trace_id.str.startswith("__")]    # 逐条数据
 | **「事件循环排队」恒为几百纳秒** | worker 数远多于连接数，压根没排队 | `ENVOY_CONCURRENCY=2` |
 | **bazel 报 `No space left on device` 但 df 有空间** | tmpfs inode 耗尽 | `df -i` 确认；`--output_base` 换到 ext4/xfs |
 | **cel-cpp 编译失败 nullability** | 缺 `--cxxopt=-Wno-nullability-completeness` | 加上重跑 |
-| **两个 Envoy 互相杀死** | `--base-id` 相同，热重启机制生效 | 给不同 base-id |
+| **两个 Envoy 互相杀死** | `--base-id` 相同，热重启机制生效 | 脚本已改用 `--use-dynamic-base-id`，各实例自动取不同值 |
+| **Envoy 报 `cannot open shared memory region /envoy_shared_memory_NNN`** | 固定 base-id 撞上**同机其他用户**的（那文件 0600 且属于创建者）。实测 `_110`/`_120` 被 root 占着 | 同上，用 `--use-dynamic-base-id`；共享机上任何全局命名空间都要假定别人也在用 |
 | **Envoy 启动报 Too many open files** | 默认 fd 软限 1024 不够，而且只是 warn（进程看似起来了实则不可用） | `ulimit -n 65536` |
 | **ssh 断连导致构建中断** | — | `nohup` 起构建，不受 ssh 生命周期影响 |
 | **传大文件卡死、小包正常** | MTU 黑洞（路径 MTU < 接口 MTU 且中间设备不回 ICMP） | `sudo sysctl -w net.ipv4.tcp_mtu_probing=1` |
@@ -393,9 +425,11 @@ ENVOY_CONCURRENCY=2 ./scripts/run-cross-machine.sh start
 
 # ── 压测 ──
 cd demo
-KITEX_PROBE_HOST=suzhou950 ./bin/client \
-    -service echo-server \
-    -c 64 -d 40s -sample 0.05
+KITEX_PROBE_HOST=suzhou950 ./bin/bencher \
+    -addr "$(../scripts/run-cross-machine.sh target)" \
+    -proto ttheader -svc echo-server \
+    -trace "$RUN/trace-client.ndjson" -node kitex-client \
+    -b 1024 -c 16 -qps 16000 -t 40 -warmup 3 -sample 0.02
 
 # ── 收数据（顺序不能换）──
 cd ~/envoy_kitex/mesh-lab

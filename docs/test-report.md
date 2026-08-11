@@ -659,6 +659,14 @@ Envoy 侧同理：通用读路径（`connection_impl.cc` 的 epoll/readv 点位�
 
 完整步骤见 [`runbook-reproduce.md`](runbook-reproduce.md)。本报告的数据这样产出：
 
+> ⚠️ **下面这段命令是 2026-08-07 当时真实跑的，原样保留作为记录 —— 但现在照抄跑不通。**
+> 2026-08-11 起加压器换成了 kitex-benchmark 派生的 `bencher`
+> （`./bin/client -target … -c 1 -size 64 -d 20s` → `./bin/bencher -addr … -proto ttheader
+> -svc echo-server -b 64 -c 1 -qps … -t 20`），换代理由见
+> [demo-vs-kitex-benchmark.md](demo-vs-kitex-benchmark.md)。
+> **要复现请用 runbook 里的当前写法**；本报告的数字仍是旧加压器产出的，
+> 与 2026-08-11 之后的数据不可直接比。
+
 ```bash
 cd ~/envoy_kitex/mesh-lab
 export ENVOY_CONCURRENCY=4          # 三级必须同值，否则线程规模差异混进级差

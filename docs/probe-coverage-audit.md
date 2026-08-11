@@ -5,8 +5,8 @@
 
 判定标准仍是那一条：**去掉它之后，哪个区间就算不出来了。**
 
-> 本轮新增：Envoy 上游接收路径 3 点、netpoll 读路径 5 点。
 > 详细点位清单见 [probe-points.md](probe-points.md)，本文只做覆盖度评估。
+> **与代码的对应关系核对于 2026-08-11。**
 
 ---
 
@@ -15,13 +15,27 @@
 | 类别 | 覆盖 | 最大缺口 |
 |---|---|---|
 | 各阶段处理时间 | 🟢 **好** | 中间件/filter 链内部不可分 |
-| socket 接口时间 | 🟢 **四方向都拆到系统调用**（Go 收发 + Envoy 上游收发） | **下游 writev 采不到**（绑定已释放）。另：所谓"Go 比 Envoy 贵 7–10 倍"**已作废** —— 同机同传输实测 3.2 vs 3.1 µs |
-| 排队时间 | 🟡 **本轮从零到部分覆盖** | 内核 accept 队列、TCP 发送缓冲区阻塞、服务端 goroutine 池 |
+| socket 接口时间 | 🟢 **六个边界全部拆到系统调用**（Envoy 上下游各收发 + Go 两侧收发） | 只剩 netpoll 的**写慢路径**（EPOLLOUT 之后由 poller 续写那段）没拆。所谓"Go 比 Envoy 贵 7–10 倍"**已作废** |
+| 排队时间 | 🟡 **从零到部分覆盖** | 内核 accept 队列、TCP 发送缓冲区阻塞、服务端 goroutine 池 |
 | 链路上的时间 | 🔴 **只能得往返，且看不见 socket 以下的一切** | **网卡、驱动、协议栈、softirq 全部不可见** |
 
 **最重要的一条：整套插桩的下界是 socket 系统调用。** 网卡、驱动、中断、协议栈的时间统统被算进"纯等待"这一坨里。
 平时这不要紧——那部分本来就小且稳定。但**一旦要评测网卡本身，这恰好是唯一该看的部分，而现在完全看不见。**
-补法见 §5。
+补法见 §五。
+
+### 点位总数（2026-08-11 口径）
+
+| 位置 | 每条 trace 的去重点位名 |
+|---|---:|
+| Envoy（每跳） | **24** |
+| kitex-client（框架 10 + 自定义 10 + netpoll 9） | **29** |
+| kitex-server（框架 10 + 自定义 11 + netpoll 9） | **30** |
+| **跨机双跳合计** | **107**（实际事件 ~119，见下） |
+
+> **Envoy 侧不能数事件数。** `onWriteReady()` 每条 trace 触发多次（第 1 次是真正
+> 的发送，之后是缓冲区已排空的空写），实际事件 24~30 不等，**去重后的点位名恒为
+> 24**。merge 对同名点取最早一次，恰好取到对的那个。
+> **完整性判据是「记录==落盘 且 丢弃=0 且 下游写未归属=0」，不是数行数。**
 
 ---
 
@@ -44,7 +58,8 @@ Envoy 两个数字为 envoy-out(950) / envoy-in(920B)：
 | 响应解码 | `up_first_byte` → `resp_decoded` | 4.2 / 7.0 µs |
 | TTHeader 解码（Kitex） | `mesh_hdr_decode_*` | 710 ns（client）/ 1.7 µs（server） |
 | TTHeader 编码（Kitex） | `mesh_hdr_encode_*` | 90 / 100 ns |
-| payload 序列化 | `mesh_payload_codec_*` | 300 / 470 ns |
+| payload 序列化 | `mesh_payload_encode_*`（曾名 `mesh_payload_codec_*`） | 300 / 470 ns |
+| payload 反序列化 | `wait_read_*`（名字骗人，实为解码） | 400 ns（client）/ 550 ns（server） |
 | 业务 handler | `server_handle_start/finish` | **220 ns** |
 
 覆盖是充分的——两跳 sidecar 自身处理只占端到端 **19.1 %**（43.5 / 228.2 µs），
@@ -66,28 +81,37 @@ Envoy 两个数字为 envoy-out(950) / envoy-in(920B)：
 
 ---
 
-## 二、socket 接口时间 🟡
+## 二、socket 接口时间 🟢
 
 read/write 系统调用本身的耗时，以及围绕它的缓冲区管理。
 
-### 已覆盖
+### 已覆盖：六个边界，每个都拆到了系统调用
 
-实测值取自 2026-08-07 跨机双跳、c=1、payload 64 B（`results/2026-08-07/two-lo-detail.txt`），
-两个数字分别是 950 侧 / 920B 侧：
+一次双跳 RPC 一共穿过 **6 个 socket 边界**（每跳 Envoy 两条连接各收发一次 = 4，
+Go 两端各收发一次 = 2，共 12 次系统调用；按「代码里的插桩位置」算是 6 处）。
+实测取自 2026-08-10 跨机双跳、c=1、payload 128 B（`results/2026-08-10/two-cross-detail.txt`），
+**avg**，两个数字分别是 950 侧 / 920B 侧：
 
-| 位置 | 点位 | 实测 p50 |
-|---|---|---|
-| Envoy 上游**接收** | `up_readv_start` → `up_readv_done` | **3.5 / 6.3 µs** |
-| Envoy 上游**发送** | `up_encode_done` → `up_socket_write_done` | 290 / 710 ns |
-| netpoll **接收** | `mesh_np_readv_start` → `mesh_np_readv_done` | **2.5 µs**（2026-08-10 起服务端也有，实测 7.7 µs）|
-| Kitex **发送** | `mesh_socket_write_start` → `mesh_socket_write_finish` | 1.8 / 5.7 µs |
+| 位置 | 点位 | 传输 | 实测 avg |
+|---|---|---|---|
+| Envoy 下游**接收** | `dn_readv_start` → `dn_readv_done` | UDS / TCP | 2.2 / 4.4 µs |
+| Envoy 上游**接收** | `up_readv_start` → `up_readv_done` | TCP / UDS | 3.0 / 4.7 µs |
+| Envoy 上游**发送** | `up_writev_start` → `up_writev_done` | TCP / UDS | 5.1 / **3.4** µs |
+| Envoy 下游**发送** | `dn_writev_start` → `dn_writev_done` | UDS / TCP | **1.9** / 6.4 µs |
+| netpoll **接收** | `mesh_np_readv_start` → `mesh_np_readv_done` | UDS / UDS | 2.3 / 4.4 µs |
+| netpoll **发送** | `mesh_np_writev_start` → `mesh_np_writev_done` | UDS / UDS | **1.8** / **2.9** µs |
 
-> **接收比发送贵一个数量级**（Envoy 3.5 µs vs 290 ns）。`doRead` 内部是循环，
-> 反复 readv 直到 EAGAIN，所以是「N 次 readv + N 次 append」的总和，
-> 而发送侧一次 `writev` 就完事。这不是异常。
+> **「入队」不是「发送」，两者都留了点位，别混用。**
+> `up_encode_done` → `up_socket_write_done`（297 / 751 ns）括住的是
+> `ConnectionImpl::write()`，只做 `write_buffer_->move()` + `activateFileEvents`；
+> 同理 Kitex 的 `mesh_socket_write_start/finish`（2.1 / 3.3 µs）括住整个
+> `Flush()`，里面才是真正的 sendmsg。**做跨语言对比只能用 `*_writev_*` 那一行。**
+
+> **接收侧 Envoy 比 Go 贵，是因为 `doRead` 内部是循环**，反复 readv 直到 EAGAIN，
+> 所以是「N 次 readv + N 次 append」的总和；netpoll 的 `ioread()` 是单次。
 >
-> 950 与 920B 的差距（3.5 vs 6.3 µs，2.9 倍）是**机器差异**，不是路径差异 ——
-> 见 `test-report.md` §6 的同机对照实验。
+> 950 与 920B 的普遍差距（1.5~2.9 倍）是**机器差异**，不是路径差异 ——
+> 见 `test-report.md` §6 的同机对照实验。**看这张表时不要读成「入向更贵」。**
 
 ### ~~缺口：发送侧的不对称~~ —— 2026-08-10 拆开了，**顺带推翻了一个结论**
 
@@ -139,38 +163,61 @@ ioHandle().activateFileEvents(Event::FileReadyType::Write); // 激活写事件
 
 ### 结论：两边 writev 是一个量级，旧结论彻底作废
 
-**同机同传输的干净对比（920B，两者都写 UDS）**：
+下游 writev 补齐之后（见下一节），**同机同传输的干净对比有两对**，
+两台机器各一对，avg：
 
-| | writev 系统调用 |
-|---|---:|
-| kitex-server（Go，UDS） | **3.2 µs** |
-| envoy-in 上游（C++，UDS） | **3.1 µs** |
+| 机器 | Go 侧写 UDS | Envoy 侧写 UDS | 比值 |
+|---|---:|---:|---:|
+| 950 | kitex-client **1.8 µs** | envoy-out 下游 **1.9 µs** | 1.06 |
+| 920B | kitex-server **2.9 µs** | envoy-in 上游 **3.4 µs** | 1.17 |
 
-**基本一致。** 950 上 Go client 写 UDS 1.9 µs、envoy-out 写跨机 TCP 3.2 µs，
-传输不同不直接可比，但同样是一个量级。
+**两对都落在同一量级。** 只有一对时还能说「样本太少」，两台机器、两个方向都复现，
+这个结论就站得住了。
 
 所谓「Go 侧写 socket 比 Envoy 贵 7–10 倍」是拿 Go 的**系统调用时间**
-去比 Envoy 的**入队时间**（270~690 ns），两边量的不是一回事。
-现在 Envoy 侧三段分开了：
+去比 Envoy 的**入队时间**（300~750 ns），两边量的不是一回事。
+现在 Envoy 侧三段分开了（avg）：
 
-| 段 | envoy-out | envoy-in |
-|---|---:|---:|
-| 写socket(仅入队) | 300 ns | 770 ns |
-| 入队 → 真正写出（事件循环调度） | 1.4 µs | 2.6 µs |
-| **★ writev 系统调用** | **3.2 µs** | **3.1 µs** |
+| 段 | envoy-out 上游 | envoy-in 上游 | envoy-out 下游 | envoy-in 下游 |
+|---|---:|---:|---:|---:|
+| 写socket(仅入队) | 297 ns | 751 ns | 731 ns | 1.1 µs |
+| 入队 → 真正写出（事件循环调度） | 2.3 µs | 3.8 µs | **7.9 µs** | **11.7 µs** |
+| **★ writev 系统调用** | 5.1 µs | 3.4 µs | 1.9 µs | 6.4 µs |
 
 「入队 → 真正写出」这一段是 Envoy 异步写模型的固有延迟，Go 的同步 Flush 没有
 对应物 —— 这才是两种模型的真实差别，而不是系统调用快慢。
 
-### 剩余缺口：下游 writev 采不到 ⚠️
+> **下游那一列的「入队 → 真正写出」明显更长（7.9 / 11.7 µs）。**
+> 因为下游写发生在 `rpc_done` **之后**，中间隔着 `deferredDelete` 与
+> 一整轮事件循环；上游写则是在处理请求的同一轮里被激活的。
+> 这不是「下游 socket 更慢」，是**排到写的时机不同**。
 
-`dn_writev_*` 实测 **0 条**。原因是绑定生命周期：下游响应的
-`connection().write()` 只入队，真正的 writev 由事件循环稍后执行，
-而那时 `doDeferredRpcDestroy` 已经调过 `KITEX_PROBE_END` 释放了绑定，
-`rpcEvent` 查不到 trace 直接返回。
+### ~~剩余缺口：下游 writev 采不到~~ —— 2026-08-10 当晚补齐
 
-要采到得把绑定活到下游写完为止，涉及绑定生命周期改造，有泄漏风险，**本轮没做**。
-影响有限：Go↔Envoy 的对比用上游那条已经成立，下游写的量级可参照上游。
+原文写着「`dn_writev_*` 实测 **0 条**，要采到得把绑定活到下游写完为止，
+涉及绑定生命周期改造，有泄漏风险，**本轮没做**」。当晚就做了。
+
+难点确实在生命周期，但解法不是「不擦绑定」—— 那在流水线下会错：请求 N 的 writev
+还没跑，N+1 的 `bindTrace` 就把 `bindings[conn]` 覆盖了，N 的写会记到 N+1 头上。
+改为**单独一个 `finishing` 槽**：`endRpc` 把 binding 移交过去，`bindings` 照常擦
+（`isSampled` 语义不变）；下游 writev 走 `rpcEventTail()` 查这个槽，
+`dn_writev_done` 记完即释放。
+
+**一条连接同时最多容纳一个「待写出」的 RPC**，前一个还没写出就又结束一个时，
+计入 `g_write_lost` 并丢弃 —— 宁可丢也不误记。这也是诚实的：流水线下一次 writev
+可能同时写出多个响应，「某个 RPC 的 writev」本就不可拆。该计数进了收尾行，
+**是完整性判据的一部分**：
+
+```
+[probe] node=envoy-out host=suzhou950 记录=832004 落盘=832004 丢弃=0 下游写未归属=0
+```
+
+实测 c=1 / 16 / 64 三档均为 0（Kitex 用连接池，每条连接串行，因果上不出现流水线）。
+
+> **归档的 `results/2026-08-10/` 早于这一版实现**（那轮用的是中间版本
+> 「干脆不擦绑定」），所以那批数据里每条 trace 有 2~3 次 `dn_writev_*`，
+> 多出来的是空写。**分位数不受影响**（merge 取最早一次），但要按事件数核对
+> 完整性的话得用当前口径重跑。详见 `probe-points.md` §「下游写」。
 
 ### ~~缺口：服务端的 readv 完全没测~~ —— 2026-08-10 已补齐
 
@@ -182,21 +229,29 @@ ioHandle().activateFileEvents(Event::FileReadyType::Write); // 激活写事件
 **`OnRead` 入口取快照**（那时读早已完成，槽位是完整的一轮），
 采样与否留到 `Tracer.Finish` 再判。开销由 `KITEX_PROBE_NETPOLL_SERVER=0` 可关。
 
-补上之后服务端多出 **18.0 µs** 此前完全不可见的时间（avg，跨机双跳 c=1）：
+补上之后服务端多出 **12.9 µs** 此前完全不可见的时间
+（avg，跨机双跳 c=1，`results/2026-08-10/two-cross-detail.txt`）：
 
 | 段 | 服务端(920B) | 客户端(950) |
 |---|---:|---:|
-| poller 事件排队 | 453 ns | 198 ns |
-| **readv 系统调用** | **7.7 µs** | 2.6 µs |
-| LinkBuffer 入队 | 158 ns | 97 ns |
-| **goroutine 调度延迟** | **9.1 µs** | 3.2 µs |
-| 合计 | **18.0 µs** | 6.1 µs |
+| poller 事件排队 | 345 ns | 198 ns |
+| **readv 系统调用** | **4.4 µs** | 2.3 µs |
+| LinkBuffer 入队 | 199 ns | 103 ns |
+| **goroutine 调度延迟** | **7.3 µs** | 3.1 µs |
+| 合计 | **12.9 µs** | 5.9 µs |
 
 服务端每项都贵 2~3 倍，与 `test-report.md` §6 记的机器差异一致，不是路径差异。
 
+> **这张表的数字在 2026-08-10 那天改过三次**（18.0 → 14.8 → 12.9 µs），
+> 不是测量不稳，是**同一天里 merge 的区间口径连改了三版**（服务端 netpoll 五段
+> 落地 → 「谁在干活」重新划分 → 节点区间按点位去重）。
+> **看到别处引用 18.0 / 14.8 的，按本表为准**；口径变动的完整记录见
+> `test-report.md` §2.6。
+
 **归因收益**：端到端分解里 `UDS往返 envoy-in↔kitex-server` 从 34.7 µs 降到
-**18.9 µs**，`kitex-server 自身` 从 19.2 µs 升到 **39.9 µs** ——
-约 16 µs 从「不可解释的 UDS 往返」挪进了服务端自己的收包路径。
+**5.4 µs**，`kitex-server 自身` 从 19.2 µs 升到 **32.1 µs** ——
+原先记在「不可解释的 UDS 往返」里的时间，一部分挪进了服务端自己的收包路径，
+另一部分被 Envoy 侧同期补上的下游写点位吸收（往返的两端同时收紧了）。
 
 > 补的过程中发现 `mesh_np_trigger` 在服务端**根本没被记过**：`inputAck` 里
 > 服务端走 `onRequest()` 分支并直接返回，压根到不了记 trigger 的地方，
@@ -216,30 +271,38 @@ store，零分配，`bindTrace` 时再决定兑现还是丢弃（机制见 `prob
 「纯等待」**整段吸收 —— 上一跳那段占端到端 79 %，是全链路最大的一坨，
 却因为下界卡在 `dn_first_byte` 而从未被分解过。
 
-现在四个 socket 边界对称了：
+现在四个 socket 边界对称了，**而且每个方向都同时有「入队」与「真正的系统调用」**：
 
-| | 接收 | 发送 |
-|---|---|---|
-| Envoy 上游 | `up_readv_start/done` ✓ | `up_encode_done` → `up_socket_write_done` ✓ |
-| Envoy 下游 | `dn_readv_start/done` ✓ | `dn_encode_done` → `dn_socket_write_done` ✓ |
+| | 接收 | 发送（入队） | 发送（系统调用） |
+|---|---|---|---|
+| Envoy 上游 | `up_readv_start/done` ✓ | `up_encode_done` → `up_socket_write_done` ✓ | `up_writev_start/done` ✓ |
+| Envoy 下游 | `dn_readv_start/done` ✓ | `dn_encode_done` → `dn_socket_write_done` ✓ | `dn_writev_start/done` ✓ |
 
-响应回写也从 `resp_decoded → rpc_done` 一个粗粒度区间拆成了「响应编码 / 写 socket」两段。
+响应回写也从 `resp_decoded → rpc_done` 一个粗粒度区间拆成了
+「响应编码 / 写socket(仅入队) / 入队→真正写出 / writev」四段。
 
 ---
 
 ## 三、排队时间 🟡
 
-请求"已经就绪但还没被处理"的时间。**这一类本轮之前几乎完全空白。**
+请求"已经就绪但还没被处理"的时间。**这一类 2026-08-07 之前几乎完全空白。**
 
-### 本轮新增覆盖
+### 已覆盖
 
 | 排队发生在哪 | 点位 | 为什么重要 |
 |---|---|---|
-| **Envoy 事件循环内** | `up_epoll_wake` → `up_readv_start` | c=1 时 130 ns；**c=16 时 p90 15.5 µs / p99 41.5 µs**。**这一刀区分「Envoy 处理慢」和「Envoy 排不过来」** |
-| **netpoll 同批 epoll 事件内** | `mesh_np_epoll_wake` → `mesh_np_dispatch` | 190 ns ~ 1.1 µs，Go 侧的对应物 |
-| **goroutine 调度延迟** | `mesh_np_trigger` → `mesh_first_byte`（client）<br>`mesh_np_trigger` → `mesh_netpoll_onread`（server） | **跨机 TCP 11.4 µs / 本机 UDS 2.8 µs（4.1 倍）**。数据已进 LinkBuffer 但 RPC goroutine 还没被调度起来。2026-08-10 起服务端也有，实测 9.1 µs |
+| **Envoy 上游事件循环内** | `up_epoll_wake` → `up_readv_start` | c=1 时 190 ns；**c=16 时 p90 15.5 µs / p99 41.5 µs**。**这一刀区分「Envoy 处理慢」和「Envoy 排不过来」** |
+| **Envoy 下游事件循环内** | `dn_epoll_wake` → `dn_readv_start` | 与上一行同构，2026-08-10 补上。avg 779 ns（envoy-out）/ 1.2 µs（envoy-in） |
+| **Envoy 的异步写排队** | `*_socket_write_done` → `*_writev_start` | 「已入队但事件循环还没轮到写」。下游侧 avg 7.9 / 11.7 µs，是**这一类里最大的一项** |
+| **netpoll 同批 epoll 事件内** | `mesh_np_epoll_wake` → `mesh_np_dispatch` | 198 ns（client）/ 345 ns（server），Go 侧的对应物 |
+| **goroutine 调度延迟** | `mesh_np_trigger` → `mesh_first_byte`（client）<br>`mesh_np_trigger` → `mesh_netpoll_onread`（server） | **跨机 TCP 11.4 µs / 本机 UDS 2.8 µs（4.1 倍）**。数据已进 LinkBuffer 但 RPC goroutine 还没被调度起来。2026-08-10 起服务端也有，实测 7.3 µs |
 
-这三项是本轮最有价值的产出——它们是"负载升高时时延为什么变差"的直接答案，而此前只能看到总时延变大。
+这几项是最有价值的产出——它们是"负载升高时时延为什么变差"的直接答案，而此前只能看到总时延变大。
+
+> **「Envoy 的异步写排队」这一项是补齐 writev 点位后才冒出来的。**
+> 在此之前它整段藏在「等待上游」里（上游写）或干脆不可见（下游写）。
+> 下游侧 7.9~11.7 µs 的量级已经和 readv 系统调用相当 ——
+> **Envoy 异步写模型的固有成本，Go 的同步 Flush 没有对应物。**
 
 **2026-08-07 实测补充**，两条读法上的教训：
 
@@ -273,20 +336,45 @@ store，零分配，`bindTrace` 时再决定兑现还是丢弃（机制见 `prob
 
 ### 已覆盖：往返
 
-分层差值法（见 probe-points.md §3）能得到三段往返：
+分层差值法（见 probe-points.md §三）能得到三段往返。**统一的式子只有一个**：
 
-| 段 | 算法 |
-|---|---|
-| client↔envoy-out UDS 往返 | client总 − envoy-out总 − client本地处理 |
-| 跨机网络往返 | envoy-out总 − envoy-in总 − envoy-out处理 |
-| envoy-in↔server UDS 往返 | envoy-in总 − server总 − envoy-in处理 |
+```
+A↔B 往返 = 「A 花在等 B 身上的时间」 − 「B 的观测总时长」
+```
+
+「A 等」两端都卡在**本机与内核交接**的那一刻（`tools/merge/main.go` 的 `waitOf()`）：
+
+| A | 「A 等」取哪两个点 | 实测 avg（2026-08-10） |
+|---|---|---:|
+| kitex-client | `mesh_socket_read_start` → `mesh_np_epoll_wake` | UDS 往返 **4.7 µs** |
+| envoy-out | `up_writev_done` → `up_epoll_wake` | 跨机往返 **68.8 µs** |
+| envoy-in | 同上 | UDS 往返 **5.4 µs** |
+
+> **跨机往返 68.8 µs 对上了 `ping` 实测的 RTT 0.068 ms** —— 这是整套口径最强的
+> 一个验证信号。口径收紧之前这一列是 100 µs 量级，里面混着两端各自的本地开销。
 
 每一项都是两个各自在本机测得的时长相减，**对时钟偏斜免疫**（实测两机差 15.5 秒左右仍成立，且注入额外 50 秒偏移后输出逐字节不变）。
+
+> **「往返」不是纯线路时间。** B 起算点之前的排队（listener/worker 队列、
+> goroutine 调度）落在 B 的测量区间之外，全被这个差值吸收。实测 Envoy worker
+> 从 384 压到 2 时，同机 UDS「往返」从 21 µs 涨到 128 µs —— 多出来的一百微秒
+> 是排队不是传输。**低负载无排队时才近似真实传输时间。**
 
 ### 根本限制一：拆不出单向
 
 差值法只能得往返。拆单向需要两端时钟精确同步到亚微秒——**PTP + 硬件时间戳网卡**。
 这不是插桩能力问题，是物理限制。NTP（毫秒级）远远不够。
+
+### 根本限制一·五：报文一大，「往返」这一列就失效 ⚠️（2026-08-11 新发现）
+
+`A↔B 往返 = A 等 − B 总` 隐含「B 的区间完全嵌套在 A 的等待里」。
+**单条消息大到要多轮 socket 读写时，对端在发送方还没写完就已经开始读**，
+B 总里混进了「A 还在写」的时间，差值可能为负 ——
+2026-08-11 的 64K 格实测 avg **−1.00 µs**，p50 −1.8 µs。
+
+同轮 1K/4K/8K/16K 全部正常。**判据：报文接近一次 socket 读写能吞下的量时，
+不要引用「往返」那几列**；节点自身与各 socket 分段不受影响。
+机制见 `probe-points.md` §三。
 
 ### 根本限制二：看不见 socket 以下的一切 ⚠️
 
@@ -379,16 +467,22 @@ ss -ti                                                  # 重传、RTT、cwnd
 
 ---
 
-## 六、本轮之后的点位总账
+## 六、点位总账（2026-08-11 核对）
 
-| 位置 | 点位数 | 本轮新增 |
+| 位置 | 点位名数 | 相对 2026-08-06 |
 |---|---:|---:|
-| Envoy（每跳） | 13 | **+3** |
-| Kitex 框架自带 | 12 | 0 |
-| Kitex 自定义 | 12 | 0 |
-| netpoll | 5 | **+5** |
+| Envoy（每跳） | **24** | +11（下游读 3、下游写 2+2、上游 writev 2、上游 epoll/readv 3、连接池标志 1 …） |
+| Kitex 框架自带 | 12（client 用 10、server 用 10） | 0 |
+| Kitex 自定义 | **11** | 0（`mesh_payload_codec_*` 更名为 `mesh_payload_encode_*`） |
+| netpoll | **9**（读 5 + 写 4），**两侧都有** | +9 |
 
-两跳拓扑下，一条被采样的请求产生约 **60 个事件**。
+两跳拓扑下，一条被采样的请求产生 **107 个去重点位名 / 约 119 个事件**
+（实测 1000 条 trace 逐条相同：client 29、envoy-out 24、envoy-in 24、server 30）。
+
+> 上一版这里写着「Envoy 13 / netpoll 5 / 约 60 个事件」，那是 2026-08-10 补下游
+> 与写路径之前的账。**核对方式**：把源码里的点位字面量抓出来，与实测 trace 里
+> 去重后的点位名逐一对照，两边必须完全相等 —— 光看代码会漏掉「写了但从没被
+> 执行到」的点位（`dn_writev_*` 就当过一阵这样的点）。
 
 ---
 
@@ -396,9 +490,15 @@ ss -ti                                                  # 重传、RTT、cwnd
 
 | 优先级 | 补什么 | 理由 |
 |---|---|---|
-| **P0** | netpoll **写**路径（writev 边界） | 唯一一个"已知有异常但查不出原因"的问题（Go 写 socket 贵 7–10 倍）。框架可复用读路径的 |
 | **P0** | `ethtool -T` 确认硬件时间戳 + SO_TIMESTAMPING | 网卡测试的前提。不做的话换网卡只能看到"总时延变了"，说不出为什么 |
 | P1 | TCP 发送缓冲区阻塞（记 write 返回值） | 成本极低，且它现在会伪装成"编码慢"，属主动误导 |
 | P1 | eBPF 补协议栈盲区 | 环境已就绪 |
 | P2 | 中间件链 / filter 链 | demo 里测不出东西，迁到真实业务前再做 |
+| P2 | netpoll 写慢路径（EPOLLOUT 之后由 poller 续写） | 小报文一次写完，走不到；大报文或对端慢时才需要 |
 | P2 | 内核 accept 队列 | 只在连接风暴场景才重要 |
+
+> **~~P0：netpoll 写路径（writev 边界）~~ 已于 2026-08-10 完成**，
+> 连带 Envoy 的 `up_writev_*` / `dn_writev_*` 一起补齐。
+> 它当初被列为 P0 的理由是「唯一一个已知有异常但查不出原因的问题
+> （Go 写 socket 贵 7–10 倍）」—— 拆开之后发现**那个异常根本不存在**，
+> 是拿入队时间比系统调用时间比出来的。见 §二。

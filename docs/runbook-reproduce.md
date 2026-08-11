@@ -370,7 +370,7 @@ git clone --depth 1 -b wip/kitex-e2e-probe        https://github.com/RiceReallyG
 git clone --depth 1 -b feat/detailed-trace-events https://github.com/RiceReallyGood/kitex.git    kitex
 git clone --depth 1 -b feat/meshlab-read-probe    https://github.com/RiceReallyGood/netpoll.git  netpoll
 git clone --depth 1 -b main                       https://github.com/RiceReallyGood/mesh-lab.git mesh-lab
-git clone --depth 1 -b main  https://github.com/cloudwego/kitex-benchmark.git kitex-benchmark
+git clone --depth 1 -b feat/meshlab-probe https://github.com/RiceReallyGood/kitex-benchmark.git kitex-benchmark
 ```
 
 本次实测（含 HEAD 校验）：
@@ -381,7 +381,7 @@ git clone --depth 1 -b main  https://github.com/cloudwego/kitex-benchmark.git ki
 | kitex | `feat/detailed-trace-events` | `98311385` | 3 s | 8.7 M |
 | netpoll | `feat/meshlab-read-probe` | `64d86026` | 2 s | 948 K |
 | mesh-lab | `main` | `6f77005f` | 2 s | 744 K |
-| kitex-benchmark | `main` | `5d7d01ea` | 2 s | 2.2 M |
+| kitex-benchmark | `feat/meshlab-probe` | `2994db33` | 2 s | 2.2 M |
 
 clone 完先对一下 commit，避免后面出了问题不知道是代码版本不对：
 
@@ -421,7 +421,7 @@ v0.14+ 给 `TProtocol` 的方法加了 `context` 参数，签名对不上直接�
 | kitex | `feat/detailed-trace-events` | 12 个细粒度事件 + 承接 netpoll 时间戳的槽位 |
 | netpoll | `feat/meshlab-read-probe` | 读路径 5 个点位（epoll 唤醒 / readv / 唤醒通知） |
 | mesh-lab | `main` | 文档、demo、Envoy 配置、merge 工具、运行脚本 |
-| kitex-benchmark | `main` | **未修改**，只借用它已生成的 echo `kitex_gen` 代码，省一次代码生成 |
+| kitex-benchmark | `feat/meshlab-probe` | **加压器本体**（fork 自 cloudwego）。对上游 3 个文件共 62 行改动 + 1 个适配层文件；`runner/`、`perf/` 一行未动。默认值 = 上游行为，见 [demo-vs-kitex-benchmark.md](demo-vs-kitex-benchmark.md) |
 
 ### 5.4 关于 `--depth 1`
 
@@ -632,10 +632,14 @@ Envoy 在后台编的时候做这个，互不干扰。
 export PATH=~/sdk/go/bin:$PATH
 export GOPROXY=https://goproxy.cn,direct GOSUMDB=off GOFLAGS=-mod=mod
 
-cd ~/envoy_kitex/mesh-lab/demo
-mkdir -p bin
-go build -o bin/server ./server
-go build -o bin/client ./client
+# 加压器/被压端在 **kitex-benchmark 仓**里构建（2026-08-11 起；自研的
+# demo/client、demo/server 已退役，只在 MESHLAB_LEGACY=1 时才需要）
+export GOTOOLCHAIN=local     # go.mod 写着 toolchain go1.23.0，本地 go 更新时会去下载它
+mkdir -p ~/envoy_kitex/mesh-lab/demo/bin
+cd ~/envoy_kitex/kitex-benchmark
+go mod tidy                  # 首次需要：juju/ratelimit、montanaflynn/stats、cloudfoundry/gosigar
+go build -o ~/envoy_kitex/mesh-lab/demo/bin/bencher  ./thrift/kitex/client
+go build -o ~/envoy_kitex/mesh-lab/demo/bin/reciever ./thrift/kitex
 
 # merge 是独立 module（meshlab/merge），必须单独构建
 cd ~/envoy_kitex/mesh-lab/tools/merge
@@ -786,11 +790,16 @@ cd ~/envoy_kitex/mesh-lab
 ./scripts/run-single-hop.sh status
 
 cd demo
-KITEX_PROBE_HOST=suzhou950 ./bin/client -n 300 -d 0 -c 1 -sample 1.0
+RUN=/tmp/kitex-demo-$(id -un)
+KITEX_PROBE_HOST=suzhou950 ./bin/bencher -addr "$RUN/out.sock" \
+    -proto ttheader -svc echo-server -trace "$RUN/trace-client.ndjson" \
+    -b 128 -c 1 -qps 300 -t 1 -warmup 1 -sample 1.0
 ```
 
-`-n 300 -d 0 -c 1 -sample 1.0` = 单并发发 300 个请求、全采样。
+`-c 1 -qps 300 -t 1` = 单并发、限速 300/s、跑 1 秒 ≈ 300 个请求，全采样。
 **验证阶段一定要 `-sample 1.0`**，请求数少，要每条都有。
+**`-proto ttheader` 不能省** —— 默认是上游的 Framed，那样没有 header KV 段，
+Envoy 既关联不了 trace 也路由不了。
 
 **本次实测：**
 
@@ -834,7 +843,9 @@ client --UDS--> envoy-out --TCP:15006--> envoy-in --UDS--> server
 ```bash
 ./scripts/run-two-hop.sh start
 ./scripts/run-two-hop.sh status
-cd demo && KITEX_PROBE_HOST=suzhou950 ./bin/client -n 300 -d 0 -c 1 -sample 1.0
+cd demo && RUN=/tmp/kitex-demo-$(id -un) && KITEX_PROBE_HOST=suzhou950 ./bin/bencher \
+    -addr "$RUN/out.sock" -proto ttheader -svc echo-server \
+    -trace "$RUN/trace-client.ndjson" -b 128 -c 1 -qps 300 -t 1 -warmup 1 -sample 1.0
 ```
 
 **本次实测：**
@@ -1074,20 +1085,35 @@ tgt=$(TOPO=single ./scripts/run-cross-machine.sh target)
 ### 7.6 压测参数与采样率
 
 ```bash
-./bin/client \
-  -target "$RUN/out.sock" \             # 默认值即 $RUN/out.sock，通常不用写
-  -service echo-server \               # 写入 TTHeader 的 ToService，供 Envoy 路由
-  -c 16 \                              # 并发
-  -d 60s \                             # 时长；-d 0 时改用 -n 指定请求数
-  -sample 0.05 \                       # 采样率
-  -size 128                            # payload 字节数
+./bin/bencher \
+  -addr "$RUN/out.sock" \   # 目标；UDS 路径或 host:port（WithHostPorts 内建 UDS 支持）
+  -proto ttheader \         # **过 Envoy 必须给**；默认 framed = 上游行为
+  -svc echo-server \        # 写入 TTHeader 的 ToService，供 Envoy 路由
+  -trace "$RUN/trace-client.ndjson" \   # **留空则完全不挂探针**
+  -node kitex-client \
+  -c 16 \                   # 并发
+  -qps 16000 \              # 目标速率；0 = 不限速（闭环打满）
+  -t 60 \                   # 计量时长，秒
+  -warmup 3 \               # 预热秒数；**预热流量不会被采样**
+  -b 1024 \                 # payload 字节数
+  -sample 0.05             # 采样率
 ```
+
+**flag 分两类**：`-addr/-c/-qps/-t/-b/-warmup/-method/-pool/-sleep` 是
+kitex-benchmark 自带的；`-proto/-svc/-trace/-sample/-node` 是本项目加的，
+**全部默认关闭 = 上游行为**（所以同一个二进制也能当干净的公认基准跑）。
 
 | 场景 | 采样率 | 理由 |
 |---|---|---|
 | 验证链路 / 调试 | `1.0` | 请求数少，要每条都有 |
-| 压测归因 | `0.01` ~ `0.05` | 实测 100% 采样有 **6.6% 开销**，会改变被测系统行为；1% 时开销低于 3% 的噪声下限 |
-| 极限吞吐 | `0` | 完全关闭 |
+| 压测归因 | 让每格落在 **3000 条左右** | 太少 p99 不可信；太多事件量爆炸（c=16 全采样是千万级）。`bench-matrix.sh` 里按格给了一张表 |
+| 极限吞吐 / 干净基线 | `-trace` 留空 | 探针完全不激活 |
+
+> 采样开销：2026-08-10 三组交错实测（不激活 / 激活不采样 / 全采样，c=1）
+> 差异全部落在噪声内（+0.9 % / −1.0 %，轮间波动最大 9.7 %）。
+> **这只证明「低于本底噪声」，不等于零开销** —— c=1 的端到端 p50 被跨机等待
+> 主导，对几微秒的插桩本就不敏感。早期报告里「100 % 采样有 6.6 % 开销」那个数
+> **已被 `test-report.md` §7 列为不可引用**（且原值是 −6.6 %，即更快，属噪声）。
 
 ---
 
@@ -1378,7 +1404,8 @@ ssh 192.168.25.51 "rm -rf ~/meshlab /tmp/kitex-demo-\$(id -un)"
 | 构建静默停滞几十分钟 | 卡在某个慢源 | `lsof -p $(pgrep -x java)` 定位（§6.1.5） |
 | **Envoy 一个点位都没有** | 没设 `KITEX_PROBE_PATH`/`KITEX_PROBE_NODE`。**不落盘且不报错** | §7.5 |
 | Envoy 启动报 `Too many open files` | fd 软限 1024 不够，**而且只是 warn** | `ulimit -n 65536` |
-| 两个 Envoy 互相杀死 | `--base-id` 相同，热重启机制生效 | 给不同 base-id |
+| 两个 Envoy 互相杀死 | `--base-id` 相同，热重启机制生效 | 脚本已改用 `--use-dynamic-base-id` |
+| Envoy 报 `cannot open shared memory region /envoy_shared_memory_NNN` | 固定 base-id 撞上**同机其他用户**的（该文件 0600 且属创建者）。2026-08-11 实测 `_110`/`_120` 被 root 占着 | 同上。共享机上任何全局命名空间都要假定别人也在用 |
 | ssh 一断 Envoy 就没了 | Envoy 收到 SIGTERM 优雅退出 | 用 tmux 托管（§7.1） |
 | socket 文件在，但连不上 | 进程早死了 | `ss -xln \| grep kitex-demo` 才是真检查 |
 | trace 文件比预期少一截 | 最后一批还在内存，线程退出才刷盘 | 先 `stop` 再读；用 SIGTERM 不要 `kill -9` |
@@ -1489,7 +1516,7 @@ git clone --depth 1 -b wip/kitex-e2e-probe        https://github.com/RiceReallyG
 git clone --depth 1 -b feat/detailed-trace-events https://github.com/RiceReallyGood/kitex.git    kitex
 git clone --depth 1 -b feat/meshlab-read-probe    https://github.com/RiceReallyGood/netpoll.git  netpoll
 git clone --depth 1 -b main                       https://github.com/RiceReallyGood/mesh-lab.git mesh-lab
-git clone --depth 1 -b main  https://github.com/cloudwego/kitex-benchmark.git kitex-benchmark
+git clone --depth 1 -b feat/meshlab-probe https://github.com/RiceReallyGood/kitex-benchmark.git kitex-benchmark
 
 # ───────── 3. bazel（版本由源码决定，所以放在 clone 之后）─────────
 BV=$(tr -d '[:space:]' < ~/envoy_kitex/envoy/.bazelversion)
@@ -1501,9 +1528,12 @@ chmod +x ~/bin/bazel && ~/bin/bazel --version
 nohup setsid ~/build-envoy.sh >/dev/null 2>&1 </dev/null &
 
 # ───────── 5. Go 侧（与上一步并行，35 s）─────────
-cd ~/envoy_kitex/mesh-lab/demo && mkdir -p bin
-go build -o bin/server ./server && go build -o bin/client ./client
-cd ../tools/merge && go build -o ~/envoy_kitex/mesh-lab/demo/bin/merge .
+mkdir -p ~/envoy_kitex/mesh-lab/demo/bin
+export GOTOOLCHAIN=local
+cd ~/envoy_kitex/kitex-benchmark && go mod tidy
+go build -o ~/envoy_kitex/mesh-lab/demo/bin/bencher  ./thrift/kitex/client
+go build -o ~/envoy_kitex/mesh-lab/demo/bin/reciever ./thrift/kitex
+cd ~/envoy_kitex/mesh-lab/tools/merge && go build -o ~/envoy_kitex/mesh-lab/demo/bin/merge .
 
 # ───────── 6. 等 Envoy 编完，做三条自检（§6.3）─────────
 until grep -q BUILD_FINISHED ~/build-envoy.log; do sleep 30; done
@@ -1518,7 +1548,9 @@ export ENVOY_CONCURRENCY=4                         # 三级取同一个值，见
 ./scripts/run-cross-machine.sh start
 ./scripts/run-cross-machine.sh status              # 三项必须全通
 tgt=$(./scripts/run-cross-machine.sh target)
-cd demo && KITEX_PROBE_HOST=<本机名> ./bin/client -target "$tgt" -n 300 -d 0 -c 1 -sample 1.0
+cd demo && KITEX_PROBE_HOST=<本机名> ./bin/bencher -addr "$tgt" \
+    -proto ttheader -svc echo-server -trace "$RUN/trace-client.ndjson" \
+    -b 128 -c 1 -qps 300 -t 1 -warmup 1 -sample 1.0
 
 # ───────── 9. 跑：归因阶梯（三级 × 三轮，交错）─────────
 #   交错而非分组连跑：后跑的组会白占缓存预热与 CPU 频率爬升的便宜。
@@ -1530,8 +1562,9 @@ for r in 1 2 3; do
     TOPO=$topo ./scripts/run-cross-machine.sh start >/dev/null 2>&1
     TOPO=$topo ./scripts/run-cross-machine.sh status >/dev/null || { echo "$topo r$r 未起来"; continue; }
     tgt=$(TOPO=$topo ./scripts/run-cross-machine.sh target)
-    ( cd demo && KITEX_PROBE_HOST=<本机名> ./bin/client \
-        -target "$tgt" -service echo-server -c 1 -size 64 -d 20s -sample 0.05 )
+    ( cd demo && KITEX_PROBE_HOST=<本机名> ./bin/bencher -addr "$tgt" \
+        -proto ttheader -svc echo-server -trace "$RUN/trace-client.ndjson" \
+        -b 1024 -c 1 -qps 1000 -t 20 -warmup 3 -sample 0.30 )
     # 顺序不能换：stop（线程退出才刷盘）→ collect（拉回对端数据）
     TOPO=$topo ./scripts/run-cross-machine.sh stop >/dev/null 2>&1; sleep 5
     TOPO=$topo ./scripts/run-cross-machine.sh collect >/dev/null 2>&1
@@ -1576,6 +1609,6 @@ diff -q /tmp/skew.txt /tmp/noskew.txt && echo "✅ 对时钟偏斜免疫"
 | kitex | `feat/detailed-trace-events` | `98311385` |
 | netpoll | `feat/meshlab-read-probe` | `64d86026` |
 | mesh-lab | `main` | `6f77005f` |
-| kitex-benchmark | `main` | `5d7d01ea` |
+| kitex-benchmark | `feat/meshlab-probe` | `2994db33` |
 
 复现出的数字和 [test-report.md](test-report.md) 对不上时，先核对这张表。
