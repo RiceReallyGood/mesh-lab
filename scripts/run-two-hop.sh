@@ -14,10 +14,13 @@ SESSION=meshlab2
 
 ULIMIT_CMD="ulimit -n 65536"
 
-# 两个 Envoy 必须用不同 base-id。同 base-id 时，后启动的会通过共享域套接字
-# 通知先启动的退出（热重启机制），表现为「起了第二个，第一个就死了」。
-BASE_OUT=11
-BASE_IN=12
+# base-id 曾经写死，但在**共享开发机**上会撞别的用户：base-id N 对应
+# /dev/shm/envoy_shared_memory_<N*10>，该文件 0600 且属于创建者。
+# 2026-08-11 实测 _110/_120 被 root 占着，Envoy 直接 abort：
+#   panic: cannot open shared memory region /envoy_shared_memory_110
+# 改用 --use-dynamic-base-id：每个实例自己挑没被占的，既不撞别人也不互踢。
+# 本脚本从不按 base-id 找进程（停止走 pkill -x envoy-static），丢掉已知值无代价。
+BASE_FLAG="--use-dynamic-base-id"
 
 start() {
   mkdir -p "$RUN"
@@ -31,16 +34,16 @@ start() {
     "$ULIMIT_CMD; $DEMO/bin/server -addr $RUN/app.sock -trace $RUN/trace-server.ndjson 2>&1 | tee $RUN/server.log"
   sleep 2
 
-  echo "[2/3] envoy-in (TCP 127.0.0.1:15006, base-id=$BASE_IN)"
+  echo "[2/3] envoy-in (TCP 127.0.0.1:15006)"
   # 探针输出路径经环境变量传入（不扩展 bootstrap schema，见 probe.cc 注释）。
   # 不设这两个变量即为「无探针」模式，用于 §8.6 的对照组。
   tmux new-window -t "$SESSION" -n envoy-in \
-    "$ULIMIT_CMD; KITEX_PROBE_PATH=$RUN/trace-envoy-in.ndjson KITEX_PROBE_NODE=envoy-in $ENVOY -c $CONF/two-hop-in.yaml --base-id $BASE_IN --log-level info 2>&1 | tee $RUN/envoy-in.log"
+    "$ULIMIT_CMD; KITEX_PROBE_PATH=$RUN/trace-envoy-in.ndjson KITEX_PROBE_NODE=envoy-in $ENVOY -c $CONF/two-hop-in.yaml $BASE_FLAG --log-level info 2>&1 | tee $RUN/envoy-in.log"
   sleep 3
 
-  echo "[3/3] envoy-out (UDS $RUN/out.sock, base-id=$BASE_OUT)"
+  echo "[3/3] envoy-out (UDS $RUN/out.sock)"
   tmux new-window -t "$SESSION" -n envoy-out \
-    "$ULIMIT_CMD; KITEX_PROBE_PATH=$RUN/trace-envoy-out.ndjson KITEX_PROBE_NODE=envoy-out $ENVOY -c $CONF/two-hop-out.yaml --base-id $BASE_OUT --log-level info 2>&1 | tee $RUN/envoy-out.log"
+    "$ULIMIT_CMD; KITEX_PROBE_PATH=$RUN/trace-envoy-out.ndjson KITEX_PROBE_NODE=envoy-out $ENVOY -c $CONF/two-hop-out.yaml $BASE_FLAG --log-level info 2>&1 | tee $RUN/envoy-out.log"
   sleep 3
 
   status

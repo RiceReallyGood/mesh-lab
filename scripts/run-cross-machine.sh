@@ -49,6 +49,22 @@ CONC_FLAG=""
 DEMO="$LOCAL_ROOT/mesh-lab/demo"
 CONF="$LOCAL_ROOT/mesh-lab/envoy-conf"
 
+# 服务端二进制。
+#
+# 默认用 **kitex-benchmark 派生的 reciever**（改动见 kitex-benchmark 仓的
+# thrift/meshlab.go，`git diff` 即差异清单）—— 归因数字要站得住，加压/被压
+# 两端都得是公认实现，自己写的那份别人无从核对。
+#
+# 它比旧的 demo/server 多两个 flag：-proto（默认 framed，过 Envoy 必须给
+# ttheader）与 -node。设 MESHLAB_LEGACY=1 回到旧的 demo/server。
+if [ "${MESHLAB_LEGACY:-0}" = "1" ]; then
+  SRV_BIN="server"
+  SRV_ARGS=""
+else
+  SRV_BIN="reciever"
+  SRV_ARGS="-proto ttheader -node kitex-server"
+fi
+
 # 运行目录**按用户隔离**。
 #
 # 曾经两台机器都写死 /tmp/kitex-demo —— 这两台是共享开发机，2026-08-10 就撞上了：
@@ -87,9 +103,22 @@ SESSION=meshxm
 
 # 每个 Envoy 实例的 base-id 必须唯一：同 base-id 的新实例启动时会通过
 # 共享域套接字通知旧实例退出（热重启机制），表现为「起了新的，旧的就死了」。
-BASE_OUT=11        # 双跳的 envoy-out
-BASE_IN=12         # 双跳的 envoy-in（在对端，本不会冲突，取值与单机模式一致便于排查）
-BASE_SINGLE=13     # 单跳的 envoy-out
+#
+# **但固定值在共享开发机上会撞车，而且撞的是别的用户。** base-id N 对应
+# /dev/shm/envoy_shared_memory_<N*10>，那个文件是 0600 且属于创建者：
+# 2026-08-11 实测 _110 与 _120 都被 root 占着（另有 wsy、l50061311 两个用户
+# 各占了一批），我方 Envoy 直接 abort：
+#
+#   panic: cannot open shared memory region /envoy_shared_memory_110
+#          check user permissions.
+#
+# 这与 2026-08-10 那次 /tmp/kitex-demo 撞车是同一类问题 —— 共享机上任何
+# 全局命名空间都得假定别人也在用。运行目录当时按用户隔离了，base-id 漏了。
+#
+# 改用 --use-dynamic-base-id：Envoy 自己挑一个没被占的，彻底不需要我们协调。
+# 本脚本从不按 base-id 找进程（停止走 pkill -x envoy-static），所以丢掉这个
+# 已知值没有代价；反过来每个实例天然拿到独立 id，热重启互踢也不会发生。
+BASE_FLAG="--use-dynamic-base-id"
 
 # KITEX_PROBE_DISABLE=1 时不给 Envoy 传探针环境变量，
 # 探针代码虽在二进制里但完全不激活 —— 这是 §8.6 的基线组。
@@ -112,7 +141,7 @@ target() {
 sync_peer() {
   echo "[同步] 推送到 $PEER（TOPO=$TOPO）"
   $SSH "$PEER" "mkdir -p ~/meshlab/bin ~/meshlab/conf $PEER_RUN" 2>/dev/null
-  rsync -a "$DEMO/bin/server" "$PEER:~/meshlab/bin/server"
+  rsync -a "$DEMO/bin/$SRV_BIN" "$PEER:~/meshlab/bin/$SRV_BIN"
   # 810MB 的 envoy-static 只有 two 用得上。rsync 在文件未变时几乎零开销，
   # 但 direct/single 根本不需要它，没必要每轮都比对。
   if [ "$TOPO" = "two" ]; then
@@ -135,10 +164,10 @@ start() {
       rm -f $PEER_RUN/*.sock $PEER_RUN/*.ndjson* $PEER_RUN/*.log
       tmux new-session -d -s $SESSION
       tmux new-window -t $SESSION -n server \
-        '$ULIMIT_CMD; KITEX_PROBE_HOST=suzhou920B ~/meshlab/bin/server -addr $PEER_RUN/app.sock -trace $PEER_RUN/trace-server.ndjson 2>&1 | tee $PEER_RUN/server.log'
+        '$ULIMIT_CMD; KITEX_PROBE_HOST=suzhou920B ~/meshlab/bin/$SRV_BIN -addr $PEER_RUN/app.sock $SRV_ARGS -trace $PEER_RUN/trace-server.ndjson 2>&1 | tee $PEER_RUN/server.log'
       sleep 2
       tmux new-window -t $SESSION -n envoy-in \
-        '$ULIMIT_CMD; $PROBE_IN ~/meshlab/bin/envoy-static -c ~/meshlab/conf/two-hop-in-remote.yaml --base-id $BASE_IN $CONC_FLAG --log-level info 2>&1 | tee $PEER_RUN/envoy-in.log'
+        '$ULIMIT_CMD; $PROBE_IN ~/meshlab/bin/envoy-static -c ~/meshlab/conf/two-hop-in-remote.yaml $BASE_FLAG $CONC_FLAG --log-level info 2>&1 | tee $PEER_RUN/envoy-in.log'
     " 2>/dev/null
     sleep 4
   else
@@ -149,7 +178,7 @@ start() {
       rm -f $PEER_RUN/*.sock $PEER_RUN/*.ndjson* $PEER_RUN/*.log
       tmux new-session -d -s $SESSION
       tmux new-window -t $SESSION -n server \
-        '$ULIMIT_CMD; KITEX_PROBE_HOST=suzhou920B ~/meshlab/bin/server -addr :$SRV_PORT -trace $PEER_RUN/trace-server.ndjson 2>&1 | tee $PEER_RUN/server.log'
+        '$ULIMIT_CMD; KITEX_PROBE_HOST=suzhou920B ~/meshlab/bin/$SRV_BIN -addr :$SRV_PORT $SRV_ARGS -trace $PEER_RUN/trace-server.ndjson 2>&1 | tee $PEER_RUN/server.log'
     " 2>/dev/null
     sleep 3
   fi
@@ -163,19 +192,19 @@ start() {
       echo "[本机] 无 sidecar，client 直连 $PEER_IP:$SRV_PORT"
       ;;
     single)
-      echo "[本机] 启动 envoy-out（single-hop-remote，base-id=$BASE_SINGLE）"
+      echo "[本机] 启动 envoy-out（single-hop-remote，动态 base-id）"
       gen_conf single-hop-remote.yaml "$RUN"
       tmux new-session -d -s "$SESSION"
       tmux new-window -t "$SESSION" -n envoy-out \
-        "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $GEN_CONF/single-hop-remote.yaml --base-id $BASE_SINGLE $CONC_FLAG --log-level info 2>&1 | tee $RUN/envoy-out.log"
+        "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $GEN_CONF/single-hop-remote.yaml $BASE_FLAG $CONC_FLAG --log-level info 2>&1 | tee $RUN/envoy-out.log"
       sleep 3
       ;;
     two)
-      echo "[本机] 启动 envoy-out（two-hop-out-remote，base-id=$BASE_OUT）"
+      echo "[本机] 启动 envoy-out（two-hop-out-remote，动态 base-id）"
       gen_conf two-hop-out-remote.yaml "$RUN"
       tmux new-session -d -s "$SESSION"
       tmux new-window -t "$SESSION" -n envoy-out \
-        "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $GEN_CONF/two-hop-out-remote.yaml --base-id $BASE_OUT $CONC_FLAG --log-level info 2>&1 | tee $RUN/envoy-out.log"
+        "$ULIMIT_CMD; $PROBE_OUT $ENVOY -c $GEN_CONF/two-hop-out-remote.yaml $BASE_FLAG $CONC_FLAG --log-level info 2>&1 | tee $RUN/envoy-out.log"
       sleep 3
       ;;
   esac
@@ -188,7 +217,7 @@ stop() {
   # 少一步会让小批量验证轮的打点数据静默丢失，详见 run-direct.sh 的同名函数注释。
   sleep 2
   pkill -u "$USER" -x envoy-static 2>/dev/null
-  $SSH "$PEER" "pkill -u \$USER -x envoy-static 2>/dev/null; pkill -u \$USER -x server 2>/dev/null" 2>/dev/null
+  $SSH "$PEER" "pkill -u \$USER -x envoy-static 2>/dev/null; pkill -u \$USER -x server 2>/dev/null; pkill -u \$USER -x reciever 2>/dev/null" 2>/dev/null
   sleep 2
   tmux kill-session -t "$SESSION" 2>/dev/null
   $SSH "$PEER" "tmux kill-session -t $SESSION 2>/dev/null" 2>/dev/null

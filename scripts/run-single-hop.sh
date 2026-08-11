@@ -20,10 +20,13 @@ SESSION=meshlab
 # 而且只是 warn —— 进程看似起来了实则不可用。硬限 524288，无需 sudo。
 ULIMIT_CMD="ulimit -n 65536"
 
-# Envoy 的热重启机制：同 base-id 的新实例启动时会通过共享域套接字
-# 通知旧实例退出。同机跑多个 Envoy（双跳降级模式）必须给不同 base-id，
-# 否则它们会互相杀死。
-ENVOY_BASE_ID=${ENVOY_BASE_ID:-7}
+# base-id 曾经写死，但在**共享开发机**上会撞别的用户：base-id N 对应
+# /dev/shm/envoy_shared_memory_<N*10>，该文件 0600 且属于创建者。
+# 2026-08-11 实测 _110/_120 被 root 占着，Envoy 直接 abort：
+#   panic: cannot open shared memory region /envoy_shared_memory_110
+# 改用 --use-dynamic-base-id：每个实例自己挑没被占的，既不撞别人也不互踢。
+# 本脚本从不按 base-id 找进程（停止走 pkill -x envoy-static），丢掉已知值无代价。
+BASE_FLAG="--use-dynamic-base-id"
 
 start() {
   mkdir -p "$RUN"
@@ -37,12 +40,12 @@ start() {
     "$ULIMIT_CMD; $DEMO/bin/server -addr $RUN/app.sock -trace $RUN/trace-server.ndjson 2>&1 | tee $RUN/server.log"
   sleep 2
 
-  echo "[2/3] envoy (监听 $RUN/out.sock, base-id=$ENVOY_BASE_ID)"
+  echo "[2/3] envoy (监听 $RUN/out.sock, 动态 base-id)"
   # 探针靠环境变量初始化，不设就完全不落盘 —— 而且不报错，
   # 表现为「Envoy 一个点位都没有」，很容易误判成打点代码坏了。
   # 双跳的两个脚本一直有这段，单跳漏了，2026-08-07 补上。
   tmux new-window -t "$SESSION" -n envoy \
-    "$ULIMIT_CMD; KITEX_PROBE_HOST=${KITEX_PROBE_HOST:-suzhou950} KITEX_PROBE_PATH=$RUN/trace-envoy.ndjson KITEX_PROBE_NODE=envoy $ENVOY -c $CONF --log-level info --base-id $ENVOY_BASE_ID 2>&1 | tee $RUN/envoy.log"
+    "$ULIMIT_CMD; KITEX_PROBE_HOST=${KITEX_PROBE_HOST:-suzhou950} KITEX_PROBE_PATH=$RUN/trace-envoy.ndjson KITEX_PROBE_NODE=envoy $ENVOY -c $CONF --log-level info $BASE_FLAG 2>&1 | tee $RUN/envoy.log"
   sleep 4
 
   echo "[3/3] 检查"

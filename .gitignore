@@ -11,3 +11,4 @@
 # 入库的是 *-table-sample.csv；merge 二进制是本地临时编的，更不该进。
 /docs/results/*/*-table.csv
 /docs/results/*/merge
+__pycache__/
